@@ -29,6 +29,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+        'scan_reader = wall_follower.scan_reader:main',
         ],
     },
 )
