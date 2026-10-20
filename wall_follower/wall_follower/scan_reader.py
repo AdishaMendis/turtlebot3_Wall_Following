@@ -1,5 +1,6 @@
 import math
 import time
+from nav_msgs.msg import Odometry
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -12,14 +13,24 @@ from sensor_msgs.msg import LaserScan
 class ScanReader(Node):
     def __init__(self):
         super().__init__('scan_reader')
+        
+        self.yaw = None
 
+        self.odom_subscription = self.create_subscription(
+            Odometry,
+            '/odom',
+            self.odom_callback,
+            qos_profile_sensor_data,
+        )
+        
         self.desired_distance = 0.30
         self.kp = 1.0
         self.forward_speed = 0.05
         self.front_stop_distance = 0.35
 
         self.last_scan_time = None
-        self.front_stop = False
+        self.turn_target = None
+        self.last_odom_time = None
 
         self.publisher = self.create_publisher(
             Twist, '/cmd_vel', 10
@@ -39,11 +50,34 @@ class ScanReader(Node):
 
     def stop_robot(self):
         self.publisher.publish(Twist())
+        
+    def odom_callback(self, msg):
+        self.last_odom_time = time.monotonic()
+        q = msg.pose.pose.orientation
+
+        sin_yaw = 2.0 * (q.w * q.z + q.x * q.y)
+        cos_yaw = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+
+        self.yaw = math.atan2(sin_yaw, cos_yaw)
+
+        self.get_logger().info(
+            f'Heading: {math.degrees(self.yaw):+.1f} degrees',
+            throttle_duration_sec=2.0,
+        )
 
     def check_scan(self):
-        if self.last_scan_time is None:
-            self.stop_robot()
-        elif time.monotonic() - self.last_scan_time > 1.0:
+        now = time.monotonic()
+
+        scan_missing = (
+            self.last_scan_time is None
+            or now - self.last_scan_time > 1.0
+        )
+        odom_missing = (
+            self.last_odom_time is None
+            or now - self.last_odom_time > 1.0
+        )
+
+        if scan_missing or odom_missing:
             self.stop_robot()
 
     def distance_at_angle(self, msg, target_degrees):
@@ -81,17 +115,43 @@ class ScanReader(Node):
             return
 
         # Once triggered, stay stopped until this node is restarted.
-        if front <= self.front_stop_distance:
-            self.front_stop = True
-
-        if self.front_stop:
+        # Wait for a recent heading measurement.
+        if (
+            self.yaw is None
+            or self.last_odom_time is None
+            or time.monotonic() - self.last_odom_time > 1.0
+        ):
             self.stop_robot()
-            self.get_logger().info(
-                f'Front wall reached: stopped at {front:.3f} m',
-                throttle_duration_sec=2.0,
-            )
             return
 
+        # Start a 90-degree left turn at the front wall.
+        if self.turn_target is None:
+            if front <= self.front_stop_distance:
+                self.turn_target = self.yaw + math.pi / 2
+                self.get_logger().info('Starting left turn')
+
+        if self.turn_target is not None:
+            # Wrap the heading error into -pi to +pi.
+            difference = self.turn_target - self.yaw
+            turn_error = math.atan2(
+                math.sin(difference),
+                math.cos(difference),
+            )
+
+            if abs(turn_error) <= math.radians(2):
+                self.stop_robot()
+                self.turn_target = None
+                self.get_logger().info(
+                    'Turn complete: resuming wall following'
+                )
+            else:
+                command = Twist()
+                command.angular.z = max(
+                    -0.4, min(0.4, 1.5 * turn_error)
+                )
+                self.publisher.publish(command)
+
+            return
         error = right - self.desired_distance
         angular_velocity = -self.kp * error
         angular_velocity = max(-0.5, min(0.5, angular_velocity))
