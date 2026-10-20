@@ -53,11 +53,17 @@ class ScanReader(Node):
             return
 
         error = right - desired_distance
+        kp = 1.0
+        angular_velocity = -kp * error
+
+        # Limit the calculated turn rate to +/-0.5 rad/s.
+        angular_velocity = max(-0.5, min(0.5, angular_velocity))
 
         self.get_logger().info(
             f'Front: {front:.3f} m | '
             f'Right: {right:.3f} m | '
-            f'Error: {error:+.3f} m',
+            f'Error: {error:+.3f} m | '
+            f'Turn: {angular_velocity:+.3f} rad/s',
             throttle_duration_sec=2.0,
         )
 
