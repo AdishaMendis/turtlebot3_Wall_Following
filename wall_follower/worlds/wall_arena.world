@@ -1,0 +1,111 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="wall_arena">
+
+    <!-- Lighting and ground -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- North wall: inner face at y = +1.0 m -->
+    <model name="north_wall">
+      <static>true</static>
+      <pose>0 1.05 0.25 0 0 0</pose>
+
+      <link name="wall">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>2.2 0.1 0.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>2.2 0.1 0.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- South wall: inner face at y = -1.0 m -->
+    <model name="south_wall">
+      <static>true</static>
+      <pose>0 -1.05 0.25 0 0 0</pose>
+
+      <link name="wall">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>2.2 0.1 0.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>2.2 0.1 0.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- East wall: inner face at x = +1.0 m -->
+    <model name="east_wall">
+      <static>true</static>
+      <pose>1.05 0 0.25 0 0 0</pose>
+
+      <link name="wall">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.1 2.0 0.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.1 2.0 0.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- West wall: inner face at x = -1.0 m -->
+    <model name="west_wall">
+      <static>true</static>
+      <pose>-1.05 0 0.25 0 0 0</pose>
+
+      <link name="wall">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.1 2.0 0.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.1 2.0 0.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>
