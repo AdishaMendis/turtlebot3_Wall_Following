@@ -43,11 +43,21 @@ class ScanReader(Node):
         front = self.distance_at_angle(msg, 0)
         right = self.distance_at_angle(msg, -90)
 
-        front_text = 'unavailable' if front is None else f'{front:.3f} m'
-        right_text = 'unavailable' if right is None else f'{right:.3f} m'
+        desired_distance = 0.30
+
+        if front is None or right is None:
+            self.get_logger().warning(
+                'Front or right distance unavailable',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        error = right - desired_distance
 
         self.get_logger().info(
-            f'Front: {front_text} | Right: {right_text}',
+            f'Front: {front:.3f} m | '
+            f'Right: {right:.3f} m | '
+            f'Error: {error:+.3f} m',
             throttle_duration_sec=2.0,
         )
 
