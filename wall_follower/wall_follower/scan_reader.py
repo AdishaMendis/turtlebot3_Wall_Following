@@ -15,7 +15,7 @@ class ScanReader(Node):
         super().__init__('scan_reader')
         
         self.yaw = None
-
+        self.wall_heading = None
         self.odom_subscription = self.create_subscription(
             Odometry,
             '/odom',
@@ -25,7 +25,11 @@ class ScanReader(Node):
         
         self.desired_distance = 0.30
         self.kp = 1.0
-        self.forward_speed = 0.05
+        self.kd = 0.5
+        self.previous_error = None
+        self.previous_scan_time = None
+        self.filtered_derivative = 0.0
+        self.forward_speed = 0.07
         self.front_stop_distance = 0.35
 
         self.last_scan_time = None
@@ -50,6 +54,10 @@ class ScanReader(Node):
 
     def stop_robot(self):
         self.publisher.publish(Twist())
+        # Start fresh after stopping or completing a corner.
+        self.previous_error = None
+        self.previous_scan_time = None
+        self.filtered_derivative = 0.0
         
     def odom_callback(self, msg):
         self.last_odom_time = time.monotonic()
@@ -59,7 +67,10 @@ class ScanReader(Node):
         cos_yaw = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
 
         self.yaw = math.atan2(sin_yaw, cos_yaw)
-
+        # Record the initial direction as the first wall heading.
+        if self.wall_heading is None:
+            self.wall_heading = self.yaw
+            
         self.get_logger().info(
             f'Heading: {math.degrees(self.yaw):+.1f} degrees',
             throttle_duration_sec=2.0,
@@ -127,7 +138,8 @@ class ScanReader(Node):
         # Start a 90-degree left turn at the front wall.
         if self.turn_target is None:
             if front <= self.front_stop_distance:
-                self.turn_target = self.yaw + math.pi / 2
+                self.wall_heading += math.pi / 2
+                self.turn_target = self.wall_heading
                 self.get_logger().info('Starting left turn')
 
         if self.turn_target is not None:
@@ -153,7 +165,35 @@ class ScanReader(Node):
 
             return
         error = right - self.desired_distance
-        angular_velocity = -self.kp * error
+
+        # Use the laser timestamp so timing follows simulation time.
+        scan_time = (
+            msg.header.stamp.sec
+            + msg.header.stamp.nanosec * 1e-9
+        )
+
+        if self.previous_scan_time is not None:
+            dt = scan_time - self.previous_scan_time
+
+            if 0.001 <= dt <= 1.0:
+                derivative = (error - self.previous_error) / dt
+
+                # Smooth the derivative to reduce laser-noise effects.
+                alpha = dt / (0.3 + dt)
+                self.filtered_derivative += alpha * (
+                    derivative - self.filtered_derivative
+                )
+            else:
+                self.filtered_derivative = 0.0
+
+        self.previous_error = error
+        self.previous_scan_time = scan_time
+
+        angular_velocity = -(
+            self.kp * error
+            + self.kd * self.filtered_derivative
+        )
+
         angular_velocity = max(-0.5, min(0.5, angular_velocity))
 
         command = Twist()
