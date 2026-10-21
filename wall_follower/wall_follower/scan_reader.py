@@ -17,20 +17,63 @@ class ScanReader(Node):
     def __init__(self):
         super().__init__('scan_reader')
 
-        # PID controller settings.
-        self.desired_distance = 0.30
-        self.kp = 1.0
-        self.ki = 0.01
-        self.kd = 0.5
+        # Declare settings that can be overridden at startup.
+        defaults = {
+            'desired_distance': 0.30,
+            'kp': 1.0,
+            'ki': 0.01,
+            'kd': 0.5,
+            'forward_speed': 0.07,
+            'front_stop_distance': 0.35,
+            'integral_limit': 0.20,
+            'derivative_filter_time': 0.30,
+            'max_angular_speed': 0.50,
+            'corner_angular_speed': 0.40,
+            'corner_kp': 1.5,
+            'corner_tolerance_deg': 2.0,
+            'sensor_timeout': 1.0,
+        }
 
-        self.forward_speed = 0.07
-        self.front_stop_distance = 0.35
+        for name, default in defaults.items():
+            self.declare_parameter(name, default)
 
-        # Integral state and accumulation limit.
+        # Read parameters into controller variables.
+        settings = {
+            name: float(self.get_parameter(name).value)
+            for name in defaults
+        }
+
+        for name, value in settings.items():
+            if not math.isfinite(value):
+                raise ValueError(f'{name} must be finite')
+
+        positive_settings = [
+            'desired_distance',
+            'front_stop_distance',
+            'derivative_filter_time',
+            'max_angular_speed',
+            'corner_angular_speed',
+            'corner_kp',
+            'corner_tolerance_deg',
+            'sensor_timeout',
+        ]
+
+        for name in positive_settings:
+            if settings[name] <= 0.0:
+                raise ValueError(f'{name} must be greater than zero')
+
+        for name in ['kp', 'ki', 'kd', 'forward_speed', 'integral_limit']:
+            if settings[name] < 0.0:
+                raise ValueError(f'{name} must not be negative')
+
+        if settings['corner_tolerance_deg'] >= 90.0:
+            raise ValueError('corner_tolerance_deg must be below 90')
+
+        for name, value in settings.items():
+            setattr(self, name, value)
+
+        # PID state.
         self.integral_error = 0.0
-        self.integral_limit = 0.20
-
-        # Derivative state.
         self.previous_error = None
         self.previous_scan_time = None
         self.filtered_derivative = 0.0
@@ -44,7 +87,7 @@ class ScanReader(Node):
         self.last_scan_time = None
         self.last_odom_time = None
 
-        # Create a separate CSV file for each PID run.
+        # Create one CSV file per run.
         log_folder = Path.home() / 'wall_follower_logs'
         log_folder.mkdir(parents=True, exist_ok=True)
 
@@ -66,6 +109,16 @@ class ScanReader(Node):
         ])
         self.log_file.flush()
 
+        # Save the startup settings beside the CSV.
+        settings_path = self.log_path.with_suffix('.settings.txt')
+        settings_path.write_text(
+            '\n'.join(
+                f'{name}={value}'
+                for name, value in settings.items()
+            ) + '\n',
+            encoding='utf-8',
+        )
+
         self.publisher = self.create_publisher(
             Twist, '/cmd_vel', 10
         )
@@ -84,9 +137,15 @@ class ScanReader(Node):
             qos_profile_sensor_data,
         )
 
-        # Stop if scan or odometry messages stop arriving.
         self.watchdog = self.create_timer(0.1, self.check_scan)
 
+        self.get_logger().info(
+            f'PID gains: Kp={self.kp}, Ki={self.ki}, Kd={self.kd}'
+        )
+        self.get_logger().info(
+            f'Speed: {self.forward_speed} m/s | '
+            f'Target distance: {self.desired_distance} m'
+        )
         self.get_logger().info(f'CSV log: {self.log_path}')
         self.get_logger().info('Waiting for laser data...')
 
@@ -103,12 +162,11 @@ class ScanReader(Node):
         self.last_odom_time = time.monotonic()
         q = msg.pose.pose.orientation
 
-        # Convert quaternion orientation into yaw.
         sin_yaw = 2.0 * (q.w * q.z + q.x * q.y)
         cos_yaw = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.yaw = math.atan2(sin_yaw, cos_yaw)
 
-        # Launch with the robot aligned with the first wall.
+        # Start with the robot aligned with the first wall.
         if self.wall_heading is None:
             self.wall_heading = self.yaw
 
@@ -122,11 +180,11 @@ class ScanReader(Node):
 
         scan_missing = (
             self.last_scan_time is None
-            or now - self.last_scan_time > 1.0
+            or now - self.last_scan_time > self.sensor_timeout
         )
         odom_missing = (
             self.last_odom_time is None
-            or now - self.last_odom_time > 1.0
+            or now - self.last_odom_time > self.sensor_timeout
         )
 
         if scan_missing or odom_missing:
@@ -139,8 +197,6 @@ class ScanReader(Node):
             angle = math.degrees(
                 msg.angle_min + i * msg.angle_increment
             )
-
-            # Wrap the angle difference into -180 to +180 degrees.
             difference = (angle - target_degrees + 180) % 360 - 180
 
             if abs(difference) <= 3:
@@ -167,11 +223,11 @@ class ScanReader(Node):
             )
             return
 
-        # Require a recent heading measurement before moving.
         if (
             self.yaw is None
             or self.last_odom_time is None
-            or time.monotonic() - self.last_odom_time > 1.0
+            or time.monotonic() - self.last_odom_time
+            > self.sensor_timeout
         ):
             self.stop_robot()
             return
@@ -185,14 +241,14 @@ class ScanReader(Node):
 
         if self.turn_target is not None:
             difference = self.turn_target - self.yaw
-
-            # Wrap the heading error into -pi to +pi.
             turn_error = math.atan2(
                 math.sin(difference),
                 math.cos(difference),
             )
 
-            if abs(turn_error) <= math.radians(2):
+            if abs(turn_error) <= math.radians(
+                self.corner_tolerance_deg
+            ):
                 self.stop_robot()
                 self.turn_target = None
                 self.get_logger().info(
@@ -201,17 +257,19 @@ class ScanReader(Node):
             else:
                 command = Twist()
                 command.angular.z = max(
-                    -0.4, min(0.4, 1.5 * turn_error)
+                    -self.corner_angular_speed,
+                    min(
+                        self.corner_angular_speed,
+                        self.corner_kp * turn_error,
+                    ),
                 )
                 self.publisher.publish(command)
 
             # Exclude corner turns from the wall-following CSV.
             return
 
-        # Positive error means too far from the right wall.
         error = right - self.desired_distance
 
-        # Use the scan timestamp for PID timing.
         scan_time = (
             msg.header.stamp.sec
             + msg.header.stamp.nanosec * 1e-9
@@ -221,42 +279,38 @@ class ScanReader(Node):
             dt = scan_time - self.previous_scan_time
 
             if 0.001 <= dt <= 1.0:
-                # Trapezoidal integration of distance error.
+                # Trapezoidal integration with bounded accumulation.
                 self.integral_error += (
                     0.5 * (error + self.previous_error) * dt
                 )
-
-                # Bound integral accumulation.
                 self.integral_error = max(
                     -self.integral_limit,
                     min(self.integral_limit, self.integral_error),
                 )
 
-                # Calculate and filter the error derivative.
                 derivative = (error - self.previous_error) / dt
-                alpha = dt / (0.3 + dt)
 
+                alpha = dt / (
+                    self.derivative_filter_time + dt
+                )
                 self.filtered_derivative += alpha * (
                     derivative - self.filtered_derivative
                 )
             else:
-                # Discard accumulated history after a timing interruption.
                 self.integral_error = 0.0
                 self.filtered_derivative = 0.0
 
         self.previous_error = error
         self.previous_scan_time = scan_time
 
-        # Negative steering turns toward the right wall.
         angular_velocity = -(
             self.kp * error
             + self.ki * self.integral_error
             + self.kd * self.filtered_derivative
         )
-
-        # Limit the commanded turn rate.
         angular_velocity = max(
-            -0.5, min(0.5, angular_velocity)
+            -self.max_angular_speed,
+            min(self.max_angular_speed, angular_velocity),
         )
 
         command = Twist()
@@ -264,7 +318,6 @@ class ScanReader(Node):
         command.angular.z = angular_velocity
         self.publisher.publish(command)
 
-        # Record each valid wall-following sample.
         self.csv_writer.writerow([
             scan_time,
             front,
@@ -286,24 +339,27 @@ class ScanReader(Node):
 
 
 def main(args=None):
-    # Allow Ctrl+C to send a stop command before ROS shuts down.
     rclpy.init(
         args=args,
         signal_handler_options=SignalHandlerOptions.NO,
     )
-    node = ScanReader()
+    node = None
 
     try:
+        node = ScanReader()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            node.stop_robot()
-            time.sleep(0.1)
-        finally:
-            node.log_file.close()
-            node.destroy_node()
+        if node is not None:
+            try:
+                node.stop_robot()
+                time.sleep(0.1)
+            finally:
+                node.log_file.close()
+                node.destroy_node()
+
+        if rclpy.ok():
             rclpy.shutdown()
 
 
