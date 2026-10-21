@@ -17,33 +17,39 @@ class ScanReader(Node):
     def __init__(self):
         super().__init__('scan_reader')
 
-        # Controller settings.
+        # PID controller settings.
         self.desired_distance = 0.30
         self.kp = 1.0
+        self.ki = 0.01
         self.kd = 0.5
+
         self.forward_speed = 0.07
         self.front_stop_distance = 0.35
 
-        # Heading and corner-turn state.
-        self.yaw = None
-        self.wall_heading = None
-        self.turn_target = None
+        # Integral state and accumulation limit.
+        self.integral_error = 0.0
+        self.integral_limit = 0.20
 
         # Derivative state.
         self.previous_error = None
         self.previous_scan_time = None
         self.filtered_derivative = 0.0
 
+        # Heading and corner-turn state.
+        self.yaw = None
+        self.wall_heading = None
+        self.turn_target = None
+
         # Sensor arrival times for the watchdog.
         self.last_scan_time = None
         self.last_odom_time = None
 
-        # Create a separate CSV file for each run.
+        # Create a separate CSV file for each PID run.
         log_folder = Path.home() / 'wall_follower_logs'
         log_folder.mkdir(parents=True, exist_ok=True)
 
         filename = datetime.now().strftime(
-            'pd_run_%Y%m%d_%H%M%S_%f.csv'
+            'pid_run_%Y%m%d_%H%M%S_%f.csv'
         )
         self.log_path = log_folder / filename
         self.log_file = self.log_path.open('w', newline='')
@@ -78,6 +84,7 @@ class ScanReader(Node):
             qos_profile_sensor_data,
         )
 
+        # Stop if scan or odometry messages stop arriving.
         self.watchdog = self.create_timer(0.1, self.check_scan)
 
         self.get_logger().info(f'CSV log: {self.log_path}')
@@ -86,7 +93,8 @@ class ScanReader(Node):
     def stop_robot(self):
         self.publisher.publish(Twist())
 
-        # Reset derivative history after a stop or completed turn.
+        # Reset PID history after stopping or completing a corner.
+        self.integral_error = 0.0
         self.previous_error = None
         self.previous_scan_time = None
         self.filtered_derivative = 0.0
@@ -95,11 +103,12 @@ class ScanReader(Node):
         self.last_odom_time = time.monotonic()
         q = msg.pose.pose.orientation
 
+        # Convert quaternion orientation into yaw.
         sin_yaw = 2.0 * (q.w * q.z + q.x * q.y)
         cos_yaw = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.yaw = math.atan2(sin_yaw, cos_yaw)
 
-        # Start aligned with the first wall when launching this node.
+        # Launch with the robot aligned with the first wall.
         if self.wall_heading is None:
             self.wall_heading = self.yaw
 
@@ -130,6 +139,8 @@ class ScanReader(Node):
             angle = math.degrees(
                 msg.angle_min + i * msg.angle_increment
             )
+
+            # Wrap the angle difference into -180 to +180 degrees.
             difference = (angle - target_degrees + 180) % 360 - 180
 
             if abs(difference) <= 3:
@@ -156,6 +167,7 @@ class ScanReader(Node):
             )
             return
 
+        # Require a recent heading measurement before moving.
         if (
             self.yaw is None
             or self.last_odom_time is None
@@ -164,7 +176,7 @@ class ScanReader(Node):
             self.stop_robot()
             return
 
-        # Advance the fixed heading target at each corner.
+        # Advance the fixed heading target at each square-arena corner.
         if self.turn_target is None:
             if front <= self.front_stop_distance:
                 self.wall_heading += math.pi / 2
@@ -173,6 +185,8 @@ class ScanReader(Node):
 
         if self.turn_target is not None:
             difference = self.turn_target - self.yaw
+
+            # Wrap the heading error into -pi to +pi.
             turn_error = math.atan2(
                 math.sin(difference),
                 math.cos(difference),
@@ -191,11 +205,13 @@ class ScanReader(Node):
                 )
                 self.publisher.publish(command)
 
-            # Do not record corner turns as wall-following samples.
+            # Exclude corner turns from the wall-following CSV.
             return
 
+        # Positive error means too far from the right wall.
         error = right - self.desired_distance
 
+        # Use the scan timestamp for PID timing.
         scan_time = (
             msg.header.stamp.sec
             + msg.header.stamp.nanosec * 1e-9
@@ -205,31 +221,50 @@ class ScanReader(Node):
             dt = scan_time - self.previous_scan_time
 
             if 0.001 <= dt <= 1.0:
-                derivative = (error - self.previous_error) / dt
+                # Trapezoidal integration of distance error.
+                self.integral_error += (
+                    0.5 * (error + self.previous_error) * dt
+                )
 
-                # Low-pass filter the derivative.
+                # Bound integral accumulation.
+                self.integral_error = max(
+                    -self.integral_limit,
+                    min(self.integral_limit, self.integral_error),
+                )
+
+                # Calculate and filter the error derivative.
+                derivative = (error - self.previous_error) / dt
                 alpha = dt / (0.3 + dt)
+
                 self.filtered_derivative += alpha * (
                     derivative - self.filtered_derivative
                 )
             else:
+                # Discard accumulated history after a timing interruption.
+                self.integral_error = 0.0
                 self.filtered_derivative = 0.0
 
         self.previous_error = error
         self.previous_scan_time = scan_time
 
+        # Negative steering turns toward the right wall.
         angular_velocity = -(
             self.kp * error
+            + self.ki * self.integral_error
             + self.kd * self.filtered_derivative
         )
-        angular_velocity = max(-0.5, min(0.5, angular_velocity))
+
+        # Limit the commanded turn rate.
+        angular_velocity = max(
+            -0.5, min(0.5, angular_velocity)
+        )
 
         command = Twist()
         command.linear.x = self.forward_speed
         command.angular.z = angular_velocity
         self.publisher.publish(command)
 
-        # Record every valid wall-following sample.
+        # Record each valid wall-following sample.
         self.csv_writer.writerow([
             scan_time,
             front,
@@ -251,6 +286,7 @@ class ScanReader(Node):
 
 
 def main(args=None):
+    # Allow Ctrl+C to send a stop command before ROS shuts down.
     rclpy.init(
         args=args,
         signal_handler_options=SignalHandlerOptions.NO,
