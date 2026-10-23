@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import csv
 import math
 import time
@@ -7,120 +9,98 @@ from pathlib import Path
 import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import LaserScan
 
 
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def angle_difference(target, current):
+    difference = target - current
+    return math.atan2(math.sin(difference), math.cos(difference))
+
+
 class ScanReader(Node):
     def __init__(self):
         super().__init__('scan_reader')
 
-        # Declare settings that can be overridden at startup.
-        defaults = {
-            'desired_distance': 0.30,
-            'kp': 1.0,
-            'ki': 0.01,
-            'kd': 0.5,
-            'forward_speed': 0.07,
-            'front_stop_distance': 0.35,
-            'integral_limit': 0.20,
-            'derivative_filter_time': 0.30,
-            'max_angular_speed': 0.50,
-            'corner_angular_speed': 0.40,
-            'corner_kp': 1.5,
-            'corner_tolerance_deg': 2.0,
-            'sensor_timeout': 1.0,
-        }
+        # Distance limits in metres.
+        self.target = 0.30
+        self.max_left = 0.50
+        self.min_left = 0.20
+        self.front_limit = 0.35
+        self.front_rearm = 0.45
+        self.front_left_limit = 0.22
 
-        for name, default in defaults.items():
-            self.declare_parameter(name, default)
+        # Movement settings.
+        self.speed = 0.08
+        self.max_turn_speed = 0.50
+        self.recovery_turn_speed = 0.22
 
-        # Read parameters into controller variables.
-        settings = {
-            name: float(self.get_parameter(name).value)
-            for name in defaults
-        }
+        # PID gains: configurable at startup and while running.
+        self.declare_parameter('kp', 1.0)
+        self.declare_parameter('ki', 0.01)
+        self.declare_parameter('kd', 0.50)
 
-        for name, value in settings.items():
-            if not math.isfinite(value):
-                raise ValueError(f'{name} must be finite')
+        self.kp = float(self.get_parameter('kp').value)
+        self.ki = float(self.get_parameter('ki').value)
+        self.kd = float(self.get_parameter('kd').value)
 
-        positive_settings = [
-            'desired_distance',
-            'front_stop_distance',
-            'derivative_filter_time',
-            'max_angular_speed',
-            'corner_angular_speed',
-            'corner_kp',
-            'corner_tolerance_deg',
-            'sensor_timeout',
-        ]
+        for name in ('kp', 'ki', 'kd'):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 10.0:
+                raise ValueError(
+                    f'{name} must be between 0.0 and 10.0'
+                )
 
-        for name in positive_settings:
-            if settings[name] <= 0.0:
-                raise ValueError(f'{name} must be greater than zero')
+        self.reset_pid()
 
-        for name in ['kp', 'ki', 'kd', 'forward_speed', 'integral_limit']:
-            if settings[name] < 0.0:
-                raise ValueError(f'{name} must not be negative')
+        self.add_on_set_parameters_callback(
+            self.update_pid_parameters
+        )
 
-        if settings['corner_tolerance_deg'] >= 90.0:
-            raise ValueError('corner_tolerance_deg must be below 90')
-
-        for name, value in settings.items():
-            setattr(self, name, value)
-
-        # PID state.
-        self.integral_error = 0.0
-        self.previous_error = None
-        self.previous_scan_time = None
-        self.filtered_derivative = 0.0
-
-        # Heading and corner-turn state.
+        # Sensor and movement state.
         self.yaw = None
-        self.wall_heading = None
+        self.last_scan = None
+        self.last_odom = None
+
+        self.state = 'FOLLOW'
+        self.state_since = time.monotonic()
         self.turn_target = None
+        self.corner_armed = True
 
-        # Sensor arrival times for the watchdog.
-        self.last_scan_time = None
-        self.last_odom_time = None
-
-        # Create one CSV file per run.
-        log_folder = Path.home() / 'wall_follower_logs'
-        log_folder.mkdir(parents=True, exist_ok=True)
-
-        filename = datetime.now().strftime(
-            'pid_run_%Y%m%d_%H%M%S_%f.csv'
+        # One CSV per controller run: samples and settings in the same file.
+        folder = Path.home() / 'wall_follower_logs'
+        folder.mkdir(parents=True, exist_ok=True)
+        run_name = datetime.now().strftime(
+            'scan_reader_%Y%m%d_%H%M%S_%f'
         )
-        self.log_path = log_folder / filename
-        self.log_file = self.log_path.open('w', newline='')
-        self.csv_writer = csv.writer(self.log_file)
+        self.csv_path = folder / f'{run_name}.csv'
+        self.csv_file = self.csv_path.open(
+            'x', newline='', encoding='utf-8'
+        )
+        self.writer = csv.writer(self.csv_file)
+        self.log_started = time.monotonic()
+        self.log_setting_names = ['speed', 'target', 'max_left', 'min_left', 'front_limit', 'front_rearm', 'front_left_limit', 'max_turn_speed', 'recovery_turn_speed']
+        self.writer.writerow(['scan_time_s', 'front_m', 'left_m', 'desired_m', 'error_m', 'linear_m_s', 'angular_rad_s', 'state', 'front_left_m', 'yaw_deg', 'kp', 'ki', 'kd', 'controller', 'wall_time_s', 'elapsed_wall_s', 'speed', 'target', 'max_left', 'min_left', 'front_limit', 'front_rearm', 'front_left_limit', 'max_turn_speed', 'recovery_turn_speed'])
+        self.csv_file.flush()
 
-        self.csv_writer.writerow([
-            'scan_time_s',
-            'front_m',
-            'right_m',
-            'desired_m',
-            'error_m',
-            'linear_m_s',
-            'angular_rad_s',
-        ])
-        self.log_file.flush()
-
-        # Save the startup settings beside the CSV.
-        settings_path = self.log_path.with_suffix('.settings.txt')
-        settings_path.write_text(
-            '\n'.join(
-                f'{name}={value}'
-                for name, value in settings.items()
-            ) + '\n',
-            encoding='utf-8',
+        self.pub = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            10,
         )
 
-        self.publisher = self.create_publisher(
-            Twist, '/cmd_vel', 10
+        self.scan_subscription = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            qos_profile_sensor_data,
         )
 
         self.odom_subscription = self.create_subscription(
@@ -130,237 +110,447 @@ class ScanReader(Node):
             qos_profile_sensor_data,
         )
 
-        self.subscription = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.scan_callback,
-            qos_profile_sensor_data,
+        self.watchdog_timer = self.create_timer(
+            0.1,
+            self.watchdog,
         )
-
-        self.watchdog = self.create_timer(0.1, self.check_scan)
 
         self.get_logger().info(
-            f'PID gains: Kp={self.kp}, Ki={self.ki}, Kd={self.kd}'
+            'LEFT wall follower: target 0.30 m'
         )
         self.get_logger().info(
-            f'Speed: {self.forward_speed} m/s | '
-            f'Target distance: {self.desired_distance} m'
+            f'PID: Kp={self.kp}, Ki={self.ki}, Kd={self.kd}'
         )
-        self.get_logger().info(f'CSV log: {self.log_path}')
-        self.get_logger().info('Waiting for laser data...')
-
-    def stop_robot(self):
-        self.publisher.publish(Twist())
-
-        # Reset PID history after stopping or completing a corner.
-        self.integral_error = 0.0
-        self.previous_error = None
-        self.previous_scan_time = None
-        self.filtered_derivative = 0.0
-
-    def odom_callback(self, msg):
-        self.last_odom_time = time.monotonic()
-        q = msg.pose.pose.orientation
-
-        sin_yaw = 2.0 * (q.w * q.z + q.x * q.y)
-        cos_yaw = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.yaw = math.atan2(sin_yaw, cos_yaw)
-
-        # Start with the robot aligned with the first wall.
-        if self.wall_heading is None:
-            self.wall_heading = self.yaw
-
         self.get_logger().info(
-            f'Heading: {math.degrees(self.yaw):+.1f} degrees',
-            throttle_duration_sec=2.0,
+            f'CSV file: {self.csv_path}'
         )
 
-    def check_scan(self):
-        now = time.monotonic()
+    def update_pid_parameters(self, params):
+        changes = {}
 
-        scan_missing = (
-            self.last_scan_time is None
-            or now - self.last_scan_time > self.sensor_timeout
-        )
-        odom_missing = (
-            self.last_odom_time is None
-            or now - self.last_odom_time > self.sensor_timeout
-        )
+        for param in params:
+            if param.name not in ('kp', 'ki', 'kd'):
+                continue
 
-        if scan_missing or odom_missing:
-            self.stop_robot()
+            value = param.value
 
-    def distance_at_angle(self, msg, target_degrees):
-        readings = []
-
-        for i, distance in enumerate(msg.ranges):
-            angle = math.degrees(
-                msg.angle_min + i * msg.angle_increment
-            )
-            difference = (angle - target_degrees + 180) % 360 - 180
-
-            if abs(difference) <= 3:
-                if math.isfinite(distance):
-                    if msg.range_min <= distance <= msg.range_max:
-                        readings.append(distance)
-
-        if not readings:
-            return None
-
-        return sum(readings) / len(readings)
-
-    def scan_callback(self, msg):
-        self.last_scan_time = time.monotonic()
-
-        front = self.distance_at_angle(msg, 0)
-        right = self.distance_at_angle(msg, -90)
-
-        if front is None or right is None:
-            self.stop_robot()
-            self.get_logger().warning(
-                'Missing distance: stopping',
-                throttle_duration_sec=2.0,
-            )
-            return
-
-        if (
-            self.yaw is None
-            or self.last_odom_time is None
-            or time.monotonic() - self.last_odom_time
-            > self.sensor_timeout
-        ):
-            self.stop_robot()
-            return
-
-        # Advance the fixed heading target at each square-arena corner.
-        if self.turn_target is None:
-            if front <= self.front_stop_distance:
-                self.wall_heading += math.pi / 2
-                self.turn_target = self.wall_heading
-                self.get_logger().info('Starting left turn')
-
-        if self.turn_target is not None:
-            difference = self.turn_target - self.yaw
-            turn_error = math.atan2(
-                math.sin(difference),
-                math.cos(difference),
-            )
-
-            if abs(turn_error) <= math.radians(
-                self.corner_tolerance_deg
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 10.0
             ):
-                self.stop_robot()
-                self.turn_target = None
-                self.get_logger().info(
-                    'Turn complete: resuming wall following'
-                )
-            else:
-                command = Twist()
-                command.angular.z = max(
-                    -self.corner_angular_speed,
-                    min(
-                        self.corner_angular_speed,
-                        self.corner_kp * turn_error,
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        f'{param.name} must be a finite '
+                        'number between 0 and 10'
                     ),
                 )
-                self.publisher.publish(command)
 
-            # Exclude corner turns from the wall-following CSV.
+            changes[param.name] = float(value)
+
+        if changes:
+            for name, value in changes.items():
+                setattr(self, name, value)
+
+            self.reset_pid()
+
+            self.get_logger().info(
+                f'PID updated: Kp={self.kp:.3f}, '
+                f'Ki={self.ki:.3f}, Kd={self.kd:.3f}'
+            )
+
+        return SetParametersResult(successful=True)
+
+    def send(self, linear=0.0, angular=0.0):
+        command = Twist()
+        command.linear.x = float(linear)
+        command.angular.z = float(angular)
+
+        self.pub.publish(command)
+        return command
+
+    def reset_pid(self):
+        self.error_sum = 0.0
+        self.last_error = None
+        self.last_stamp = None
+        self.filtered_d = 0.0
+
+    def change_state(self, new_state):
+        if self.state != new_state:
+            self.state = new_state
+            self.state_since = time.monotonic()
+            self.reset_pid()
+
+            self.get_logger().info(
+                f'State: {new_state}'
+            )
+
+    def fault(self, message):
+        if self.state != 'FAULT':
+            self.get_logger().error(message)
+            self.change_state('FAULT')
+
+        return self.send()
+
+    def odom_callback(self, msg):
+        q = msg.pose.pose.orientation
+
+        components = (q.x, q.y, q.z, q.w)
+
+        if not all(math.isfinite(value) for value in components):
             return
 
-        error = right - self.desired_distance
+        norm = math.sqrt(sum(value * value for value in components))
 
-        scan_time = (
-            msg.header.stamp.sec
-            + msg.header.stamp.nanosec * 1e-9
+        if norm < 1e-9:
+            return
+
+        x, y, z, w = (
+            value / norm for value in components
         )
 
-        if self.previous_scan_time is not None:
-            dt = scan_time - self.previous_scan_time
+        self.yaw = math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+
+        self.last_odom = time.monotonic()
+
+    def sensors_ready(self, now):
+        return (
+            self.last_scan is not None
+            and self.last_odom is not None
+            and self.yaw is not None
+            and now - self.last_scan <= 1.0
+            and now - self.last_odom <= 1.0
+        )
+
+    def watchdog(self):
+        if not self.sensors_ready(time.monotonic()):
+            self.send()
+            self.reset_pid()
+
+    def distance(
+        self,
+        scan,
+        angle_deg,
+        width=3.0,
+        nearest=False,
+    ):
+        values = []
+
+        for i, reading in enumerate(scan.ranges):
+            if not math.isfinite(reading):
+                continue
+
+            if not scan.range_min <= reading <= scan.range_max:
+                continue
+
+            angle = math.degrees(
+                scan.angle_min + i * scan.angle_increment
+            )
+
+            difference = (
+                angle - angle_deg + 180.0
+            ) % 360.0 - 180.0
+
+            if abs(difference) <= width:
+                values.append(reading)
+
+        if not values:
+            return None
+
+        if nearest:
+            return min(values)
+
+        return sum(values) / len(values)
+
+    def pid(self, error, stamp):
+        if self.last_stamp is not None and self.last_error is not None:
+            dt = stamp - self.last_stamp
 
             if 0.001 <= dt <= 1.0:
-                # Trapezoidal integration with bounded accumulation.
-                self.integral_error += (
-                    0.5 * (error + self.previous_error) * dt
-                )
-                self.integral_error = max(
-                    -self.integral_limit,
-                    min(self.integral_limit, self.integral_error),
+                self.error_sum += (
+                    0.5 * (error + self.last_error) * dt
                 )
 
-                derivative = (error - self.previous_error) / dt
-
-                alpha = dt / (
-                    self.derivative_filter_time + dt
+                self.error_sum = clamp(
+                    self.error_sum,
+                    -0.20,
+                    0.20,
                 )
-                self.filtered_derivative += alpha * (
-                    derivative - self.filtered_derivative
+
+                derivative = (
+                    error - self.last_error
+                ) / dt
+
+                # Low-pass filter for the derivative.
+                alpha = dt / (0.30 + dt)
+
+                self.filtered_d += alpha * (
+                    derivative - self.filtered_d
                 )
             else:
-                self.integral_error = 0.0
-                self.filtered_derivative = 0.0
+                self.error_sum = 0.0
+                self.filtered_d = 0.0
 
-        self.previous_error = error
-        self.previous_scan_time = scan_time
+        self.last_error = error
+        self.last_stamp = stamp
 
-        angular_velocity = -(
+        # Left-wall following:
+        # Too far from left wall -> positive angular velocity.
+        # Too close to left wall -> negative angular velocity.
+        angular = (
             self.kp * error
-            + self.ki * self.integral_error
-            + self.kd * self.filtered_derivative
-        )
-        angular_velocity = max(
-            -self.max_angular_speed,
-            min(self.max_angular_speed, angular_velocity),
+            + self.ki * self.error_sum
+            + self.kd * self.filtered_d
         )
 
-        command = Twist()
-        command.linear.x = self.forward_speed
-        command.angular.z = angular_velocity
-        self.publisher.publish(command)
+        return clamp(
+            angular,
+            -self.max_turn_speed,
+            self.max_turn_speed,
+        )
 
-        self.csv_writer.writerow([
-            scan_time,
+    def record(self, stamp, front, left, front_left, command):
+        self.writer.writerow([
+            stamp,
             front,
-            right,
-            self.desired_distance,
-            error,
+            left,
+            self.target,
+            None if left is None else left - self.target,
             command.linear.x,
             command.angular.z,
-        ])
-        self.log_file.flush()
+            self.state,
+            front_left,
+            None if self.yaw is None else math.degrees(self.yaw),
+            self.kp,
+            self.ki,
+            self.kd,
+        ] + [
+            'single_pid', time.time(),
+            time.monotonic() - self.log_started,
+        ] + [getattr(self, name) for name in self.log_setting_names])
 
-        self.get_logger().info(
-            f'Front: {front:.3f} m | '
-            f'Right: {right:.3f} m | '
-            f'Error: {error:+.3f} m | '
-            f'Turn: {angular_velocity:+.3f} rad/s',
-            throttle_duration_sec=2.0,
+        self.csv_file.flush()
+
+    def scan_callback(self, scan):
+        now = time.monotonic()
+        self.last_scan = now
+
+        stamp = (
+            scan.header.stamp.sec
+            + scan.header.stamp.nanosec * 1e-9
+        )
+
+        # LiDAR directions:
+        # Front = 0 degrees.
+        # Left = +90 degrees.
+        # Front-left = +45 degrees.
+        front = self.distance(
+            scan,
+            0,
+            width=12,
+            nearest=True,
+        )
+        left = self.distance(
+            scan,
+            90,
+            width=3,
+        )
+        front_left = self.distance(
+            scan,
+            45,
+            width=12,
+            nearest=True,
+        )
+
+        # Stop on missing required data or a latched fault.
+        if (
+            self.state == 'FAULT'
+            or front is None
+            or front_left is None
+            or not self.sensors_ready(now)
+        ):
+            command = self.send()
+            self.reset_pid()
+            self.record(
+                stamp, front, left, front_left, command
+            )
+            return
+
+        # Rearm corner detection once the front clears.
+        if front >= self.front_rearm:
+            self.corner_armed = True
+
+        # Complete a 90-degree right turn using odometry.
+        if self.state == 'TURN_RIGHT':
+            error = angle_difference(
+                self.turn_target,
+                self.yaw,
+            )
+
+            if now - self.state_since > 20.0:
+                command = self.fault(
+                    'Right turn timeout'
+                )
+
+            elif (
+                front_left < self.front_left_limit
+                or (
+                    left is not None
+                    and left < self.min_left
+                )
+            ):
+                command = self.fault(
+                    'Obstacle too close during right turn'
+                )
+
+            elif abs(math.degrees(error)) <= 2.0:
+                self.turn_target = None
+                self.change_state('FOLLOW')
+                command = self.send()
+
+            else:
+                command = self.send(
+                    angular=clamp(
+                        1.5 * error,
+                        -0.40,
+                        0.40,
+                    )
+                )
+
+            self.record(
+                stamp, front, left, front_left, command
+            )
+            return
+
+        # Front wall: start one 90-degree right turn.
+        if front <= self.front_limit:
+            if (
+                self.corner_armed
+                and front_left >= self.front_left_limit
+            ):
+                self.corner_armed = False
+                self.turn_target = self.yaw - math.pi / 2.0
+                self.change_state('TURN_RIGHT')
+
+            command = self.send()
+            self.record(
+                stamp, front, left, front_left, command
+            )
+            return
+
+        # Stop for an obstruction near the front-left.
+        if front_left < self.front_left_limit:
+            command = self.send()
+            self.reset_pid()
+            self.record(
+                stamp, front, left, front_left, command
+            )
+            return
+
+        # Select normal following or recovery.
+        if self.state == 'FOLLOW':
+            if left is None or left > self.max_left:
+                self.change_state('RECOVER_LEFT')
+
+            elif left < self.min_left:
+                self.change_state('AVOID_LEFT')
+
+        elif self.state == 'RECOVER_LEFT':
+            if left is not None and left < self.min_left:
+                self.change_state('AVOID_LEFT')
+
+            elif left is not None and left <= 0.45:
+                self.change_state('FOLLOW')
+
+        elif self.state == 'AVOID_LEFT':
+            if left is None:
+                command = self.fault(
+                    'Lost left LiDAR reading while too close'
+                )
+                self.record(
+                    stamp, front, left, front_left, command
+                )
+                return
+
+            if left >= 0.25:
+                self.change_state(
+                    'RECOVER_LEFT'
+                    if left > self.max_left
+                    else 'FOLLOW'
+                )
+
+        if self.state in ('RECOVER_LEFT', 'AVOID_LEFT'):
+            if now - self.state_since > 8.0:
+                command = self.fault(
+                    'Left-wall recovery timeout'
+                )
+
+            elif (
+                self.state == 'RECOVER_LEFT'
+                and front < self.front_left_limit
+            ):
+                command = self.send()
+
+            else:
+                # Recover: rotate left toward the wall.
+                # Avoid: rotate right away from the wall.
+                turn = (
+                    self.recovery_turn_speed
+                    if self.state == 'RECOVER_LEFT'
+                    else -self.recovery_turn_speed
+                )
+
+                command = self.send(angular=turn)
+
+        elif self.state == 'FOLLOW' and left is not None:
+            error = left - self.target
+
+            command = self.send(
+                linear=self.speed,
+                angular=self.pid(error, stamp),
+            )
+
+        else:
+            command = self.send()
+
+        self.record(
+            stamp, front, left, front_left, command
         )
 
 
 def main(args=None):
+    # Handle Ctrl+C while ROS is still available to publish a stop.
     rclpy.init(
         args=args,
         signal_handler_options=SignalHandlerOptions.NO,
     )
+
     node = None
 
     try:
         node = ScanReader()
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
-    finally:
-        if node is not None:
-            try:
-                node.stop_robot()
-                time.sleep(0.1)
-            finally:
-                node.log_file.close()
-                node.destroy_node()
 
-        if rclpy.ok():
-            rclpy.shutdown()
+    finally:
+        try:
+            if node is not None:
+                try:
+                    node.send()
+                    time.sleep(0.1)
+                finally:
+                    node.csv_file.close()
+                    node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':
