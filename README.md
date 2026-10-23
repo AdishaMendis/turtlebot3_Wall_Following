@@ -58,3 +58,11 @@ ros2 run wall_follower scan_reader --ros-args \
   -p kd:=0.5 \
   -p forward_speed:=0.07 \
   -p desired_distance:=0.30
+  
+##  Single PID:
+ros2 run wall_follower single_PID --ros-args \
+  --params-file ~/ros2_ws/src/turtlebot3_Wall_Following/wall_follower/config/single_PID.yaml
+  
+## dual PID:
+ros2 run wall_follower dual_PID --ros-args \
+  --params-file ~/ros2_ws/src/turtlebot3_Wall_Following/wall_follower/config/dual_PID.yaml
