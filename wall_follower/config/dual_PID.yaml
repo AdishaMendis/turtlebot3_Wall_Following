@@ -1,0 +1,50 @@
+# All configurable controller settings. Distances: m; speeds: m/s or rad/s.
+# Gains (and dual speed settings) support live changes; other settings need restart.
+dual_PID:
+  ros__parameters:
+    target: 0.3
+    max_left: 0.4
+    min_left: 0.15
+    front_limit: 0.35
+    front_rearm: 0.45
+    front_left_limit: 0.22
+    max_turn_speed: 0.8
+    recovery_turn_speed: 0.3
+    recovery_clear_distance: 0.4
+    avoid_clear_distance: 0.28
+    integral_limit: 0.2
+    derivative_filter_time: 0.3
+    pid_dt_min: 0.001
+    pid_dt_max: 1.0
+    corner_angle_deg: 90.0
+    corner_kp: 1.5
+    corner_max_turn_speed: 0.4
+    corner_tolerance_deg: 2.0
+    turn_timeout: 20.0
+    recovery_timeout: 8.0
+    sensor_timeout: 1.0
+    watchdog_period: 0.1
+    front_angle_deg: 0.0
+    left_angle_deg: 90.0
+    front_left_angle_deg: 45.0
+    front_scan_half_width_deg: 12.0
+    left_scan_half_width_deg: 3.0
+    diagonal_scan_half_width_deg: 12.0
+    log_directory: ~/wall_follower_logs
+    kp: 0.9
+    ki: 0.01
+    kd: 0.65
+    kp_linear: 0.3
+    ki_linear: 0.04
+    kd_linear: 0.02
+    minimum_speed: 0.07
+    nominal_speed: 0.09
+    maximum_speed: 0.1
+    speed_integral_limit: 0.1
+    speed_derivative_filter_time: 0.25
+    wall_slowdown_error: 0.15
+    front_slowdown_start: 0.65
+    wall_slowdown_fraction: 0.6
+    front_min_speed_fraction: 0.4
+    front_right_angle_deg: -45.0
+    status_log_period: 0.5
