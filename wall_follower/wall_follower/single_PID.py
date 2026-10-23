@@ -9,7 +9,7 @@ from pathlib import Path
 import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
@@ -29,40 +29,46 @@ class SinglePID(Node):
     def __init__(self):
         super().__init__('single_PID')
 
-        # Distance limits in metres.
-        self.target = 0.30
-        self.max_left = 0.50
-        self.min_left = 0.20
-        self.front_limit = 0.35
-        self.front_rearm = 0.45
-        self.front_left_limit = 0.22
-
-        # Movement settings.
-        self.speed = 0.08
-        self.max_turn_speed = 0.50
-        self.recovery_turn_speed = 0.22
-
-        # PID gains: configurable at startup and while running.
-        self.declare_parameter('kp', 1.0)
-        self.declare_parameter('ki', 0.01)
-        self.declare_parameter('kd', 0.50)
-
-        self.kp = float(self.get_parameter('kp').value)
-        self.ki = float(self.get_parameter('ki').value)
-        self.kd = float(self.get_parameter('kd').value)
-
-        for name in ('kp', 'ki', 'kd'):
-            value = getattr(self, name)
-            if not math.isfinite(value) or not 0.0 <= value <= 10.0:
-                raise ValueError(
-                    f'{name} must be between 0.0 and 10.0'
-                )
-
+        # Defaults match the original working controller.
+        self.defaults = {
+            'target': 0.3,
+            'max_left': 0.5,
+            'min_left': 0.2,
+            'front_limit': 0.35,
+            'front_rearm': 0.45,
+            'front_left_limit': 0.22,
+            'max_turn_speed': 0.5,
+            'recovery_turn_speed': 0.22,
+            'recovery_clear_distance': 0.45,
+            'avoid_clear_distance': 0.25,
+            'integral_limit': 0.2,
+            'derivative_filter_time': 0.3,
+            'pid_dt_min': 0.001,
+            'pid_dt_max': 1.0,
+            'corner_angle_deg': 90.0,
+            'corner_kp': 1.5,
+            'corner_max_turn_speed': 0.4,
+            'corner_tolerance_deg': 2.0,
+            'turn_timeout': 20.0,
+            'recovery_timeout': 8.0,
+            'sensor_timeout': 1.0,
+            'watchdog_period': 0.1,
+            'front_angle_deg': 0.0,
+            'left_angle_deg': 90.0,
+            'front_left_angle_deg': 45.0,
+            'front_scan_half_width_deg': 12.0,
+            'left_scan_half_width_deg': 3.0,
+            'diagonal_scan_half_width_deg': 12.0,
+            'log_directory': '~/wall_follower_logs',
+            'kp': 1.0,
+            'ki': 0.01,
+            'kd': 0.5,
+            'speed': 0.08,
+        }
+        self.live_parameters = ('kp', 'ki', 'kd')
+        self.load_settings()
         self.reset_pid()
-
-        self.add_on_set_parameters_callback(
-            self.update_pid_parameters
-        )
+        self.add_on_set_parameters_callback(self.update_pid_parameters)
 
         # Sensor and movement state.
         self.yaw = None
@@ -75,7 +81,7 @@ class SinglePID(Node):
         self.corner_armed = True
 
         # One CSV per controller run: samples and settings in the same file.
-        folder = Path.home() / 'wall_follower_logs'
+        folder = Path(self.log_directory).expanduser()
         folder.mkdir(parents=True, exist_ok=True)
         run_name = datetime.now().strftime(
             'single_PID_%Y%m%d_%H%M%S_%f'
@@ -86,8 +92,55 @@ class SinglePID(Node):
         )
         self.writer = csv.writer(self.csv_file)
         self.log_started = time.monotonic()
-        self.log_setting_names = ['speed', 'target', 'max_left', 'min_left', 'front_limit', 'front_rearm', 'front_left_limit', 'max_turn_speed', 'recovery_turn_speed']
-        self.writer.writerow(['scan_time_s', 'front_m', 'left_m', 'desired_m', 'error_m', 'linear_m_s', 'angular_rad_s', 'state', 'front_left_m', 'yaw_deg', 'kp', 'ki', 'kd', 'controller', 'wall_time_s', 'elapsed_wall_s', 'speed', 'target', 'max_left', 'min_left', 'front_limit', 'front_rearm', 'front_left_limit', 'max_turn_speed', 'recovery_turn_speed'])
+        self.log_setting_names = ['speed', 'target', 'max_left', 'min_left', 'front_limit', 'front_rearm', 'front_left_limit', 'max_turn_speed', 'recovery_turn_speed', 'recovery_clear_distance', 'avoid_clear_distance', 'integral_limit', 'derivative_filter_time', 'pid_dt_min', 'pid_dt_max', 'corner_angle_deg', 'corner_kp', 'corner_max_turn_speed', 'corner_tolerance_deg', 'turn_timeout', 'recovery_timeout', 'sensor_timeout', 'watchdog_period', 'front_angle_deg', 'left_angle_deg', 'front_left_angle_deg', 'front_scan_half_width_deg', 'left_scan_half_width_deg', 'diagonal_scan_half_width_deg', 'log_directory']
+        self.writer.writerow([
+            'scan_time_s',
+            'front_m',
+            'left_m',
+            'desired_m',
+            'error_m',
+            'linear_m_s',
+            'angular_rad_s',
+            'state',
+            'front_left_m',
+            'yaw_deg',
+            'kp',
+            'ki',
+            'kd',
+            'controller',
+            'wall_time_s',
+            'elapsed_wall_s',
+            'speed',
+            'target',
+            'max_left',
+            'min_left',
+            'front_limit',
+            'front_rearm',
+            'front_left_limit',
+            'max_turn_speed',
+            'recovery_turn_speed',
+            'recovery_clear_distance',
+            'avoid_clear_distance',
+            'integral_limit',
+            'derivative_filter_time',
+            'pid_dt_min',
+            'pid_dt_max',
+            'corner_angle_deg',
+            'corner_kp',
+            'corner_max_turn_speed',
+            'corner_tolerance_deg',
+            'turn_timeout',
+            'recovery_timeout',
+            'sensor_timeout',
+            'watchdog_period',
+            'front_angle_deg',
+            'left_angle_deg',
+            'front_left_angle_deg',
+            'front_scan_half_width_deg',
+            'left_scan_half_width_deg',
+            'diagonal_scan_half_width_deg',
+            'log_directory',
+        ])
         self.csv_file.flush()
 
         self.pub = self.create_publisher(
@@ -111,12 +164,12 @@ class SinglePID(Node):
         )
 
         self.watchdog_timer = self.create_timer(
-            0.1,
+            self.watchdog_period,
             self.watchdog,
         )
 
         self.get_logger().info(
-            'LEFT wall follower: target 0.30 m'
+            f'LEFT wall follower: target {self.target:.3f} m'
         )
         self.get_logger().info(
             f'PID: Kp={self.kp}, Ki={self.ki}, Kd={self.kd}'
@@ -125,42 +178,111 @@ class SinglePID(Node):
             f'CSV file: {self.csv_path}'
         )
 
-    def update_pid_parameters(self, params):
-        changes = {}
+    def load_settings(self):
+        # Geometry, limits and timer settings are loaded at startup.
+        # Existing live-tunable gains/speeds remain adjustable while running.
+        for name, default in self.defaults.items():
+            self.declare_parameter(
+                name, default,
+                descriptor=ParameterDescriptor(
+                    read_only=name not in self.live_parameters
+                ),
+            )
+        settings = {
+            name: self.get_parameter(name).value for name in self.defaults
+        }
+        reason = self.validate_settings(settings)
+        if reason:
+            raise ValueError(reason)
+        for name, value in settings.items():
+            setattr(self, name, value if isinstance(value, str) else float(value))
 
-        for param in params:
-            if param.name not in ('kp', 'ki', 'kd'):
+    def validate_settings(self, settings):
+        for name, value in settings.items():
+            if name == 'log_directory':
+                if not isinstance(value, str) or not value.strip():
+                    return 'log_directory must be a nonempty path'
                 continue
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)):
+                return f'{name} must be a finite number'
+            if name.endswith('_angle_deg'):
+                if not -180.0 <= value <= 180.0:
+                    return f'{name} must be between -180 and 180 degrees'
+            elif value < 0.0:
+                return f'{name} must be nonnegative'
+            if (name in ('kp', 'ki', 'kd', 'kp_linear', 'ki_linear', 'kd_linear',
+                         'corner_kp') and value > 10.0):
+                return f'{name} must be between 0 and 10'
+            if name in ('speed', 'minimum_speed', 'nominal_speed', 'maximum_speed'):
+                if value > 0.12:
+                    return f'{name} must be between 0 and 0.12 m/s'
+        positive = (
+            'target', 'max_left', 'min_left', 'front_limit', 'front_rearm',
+            'front_left_limit', 'max_turn_speed', 'recovery_turn_speed',
+            'recovery_clear_distance', 'avoid_clear_distance',
+            'pid_dt_min', 'pid_dt_max', 'corner_angle_deg', 'corner_kp',
+            'corner_max_turn_speed', 'corner_tolerance_deg', 'turn_timeout',
+            'recovery_timeout', 'sensor_timeout', 'watchdog_period',
+            'front_scan_half_width_deg', 'left_scan_half_width_deg',
+            'diagonal_scan_half_width_deg',
+        )
+        for name in positive:
+            if settings[name] <= 0.0:
+                return f'{name} must be positive'
+        if not (settings['min_left'] < settings['avoid_clear_distance']
+                <= settings['target'] <= settings['recovery_clear_distance']
+                <= settings['max_left']):
+            return ('Require min_left < avoid_clear_distance <= target '
+                    '<= recovery_clear_distance <= max_left')
+        if settings['front_rearm'] <= settings['front_limit']:
+            return 'front_rearm must exceed front_limit'
+        if settings['pid_dt_min'] > settings['pid_dt_max']:
+            return 'pid_dt_min must not exceed pid_dt_max'
+        if not (settings['corner_tolerance_deg'] < settings['corner_angle_deg']
+                <= 180.0):
+            return 'Require corner_tolerance_deg < corner_angle_deg <= 180'
+        for name in ('front_scan_half_width_deg', 'left_scan_half_width_deg',
+                     'diagonal_scan_half_width_deg'):
+            if settings[name] > 180.0:
+                return f'{name} must not exceed 180 degrees'
+        if 'minimum_speed' in settings:
+            if not (settings['minimum_speed'] <= settings['nominal_speed']
+                    <= settings['maximum_speed']):
+                return 'Require minimum_speed <= nominal_speed <= maximum_speed'
+            if settings['front_slowdown_start'] <= settings['front_limit']:
+                return 'front_slowdown_start must exceed front_limit'
+            if settings['wall_slowdown_error'] <= 0.0:
+                return 'wall_slowdown_error must be positive'
+            if not 0.0 <= settings['wall_slowdown_fraction'] <= 1.0:
+                return 'wall_slowdown_fraction must be between 0 and 1'
+            if not 0.0 < settings['front_min_speed_fraction'] <= 1.0:
+                return 'front_min_speed_fraction must be greater than 0 and at most 1'
+            if settings['status_log_period'] <= 0.0:
+                return 'status_log_period must be positive'
+        return ''
 
-            value = param.value
-
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not 0.0 <= float(value) <= 10.0
-            ):
+    def update_pid_parameters(self, params):
+        pending = {name: getattr(self, name) for name in self.defaults}
+        changes = {}
+        for param in params:
+            if param.name not in self.defaults:
+                continue
+            if param.name not in self.live_parameters:
                 return SetParametersResult(
                     successful=False,
-                    reason=(
-                        f'{param.name} must be a finite '
-                        'number between 0 and 10'
-                    ),
+                    reason=f'{param.name} is a startup setting; edit YAML and restart',
                 )
-
-            changes[param.name] = float(value)
-
+            pending[param.name] = param.value
+            changes[param.name] = param.value
+        reason = self.validate_settings(pending)
+        if reason:
+            return SetParametersResult(successful=False, reason=reason)
         if changes:
             for name, value in changes.items():
-                setattr(self, name, value)
-
+                setattr(self, name, float(value))
             self.reset_pid()
-
-            self.get_logger().info(
-                f'PID updated: Kp={self.kp:.3f}, '
-                f'Ki={self.ki:.3f}, Kd={self.kd:.3f}'
-            )
-
+            self.get_logger().info(f'Parameters updated: {changes}')
         return SetParametersResult(successful=True)
 
     def send(self, linear=0.0, angular=0.0):
@@ -223,8 +345,8 @@ class SinglePID(Node):
             self.last_scan is not None
             and self.last_odom is not None
             and self.yaw is not None
-            and now - self.last_scan <= 1.0
-            and now - self.last_odom <= 1.0
+            and now - self.last_scan <= self.sensor_timeout
+            and now - self.last_odom <= self.sensor_timeout
         )
 
     def watchdog(self):
@@ -271,15 +393,15 @@ class SinglePID(Node):
         if self.last_stamp is not None and self.last_error is not None:
             dt = stamp - self.last_stamp
 
-            if 0.001 <= dt <= 1.0:
+            if self.pid_dt_min <= dt <= self.pid_dt_max:
                 self.error_sum += (
                     0.5 * (error + self.last_error) * dt
                 )
 
                 self.error_sum = clamp(
                     self.error_sum,
-                    -0.20,
-                    0.20,
+                    -self.integral_limit,
+                    self.integral_limit,
                 )
 
                 derivative = (
@@ -287,7 +409,7 @@ class SinglePID(Node):
                 ) / dt
 
                 # Low-pass filter for the derivative.
-                alpha = dt / (0.30 + dt)
+                alpha = dt / (self.derivative_filter_time + dt)
 
                 self.filtered_d += alpha * (
                     derivative - self.filtered_d
@@ -351,19 +473,19 @@ class SinglePID(Node):
         # Front-left = +45 degrees.
         front = self.distance(
             scan,
-            0,
-            width=12,
+            self.front_angle_deg,
+            width=self.front_scan_half_width_deg,
             nearest=True,
         )
         left = self.distance(
             scan,
-            90,
-            width=3,
+            self.left_angle_deg,
+            width=self.left_scan_half_width_deg,
         )
         front_left = self.distance(
             scan,
-            45,
-            width=12,
+            self.front_left_angle_deg,
+            width=self.diagonal_scan_half_width_deg,
             nearest=True,
         )
 
@@ -392,7 +514,7 @@ class SinglePID(Node):
                 self.yaw,
             )
 
-            if now - self.state_since > 20.0:
+            if now - self.state_since > self.turn_timeout:
                 command = self.fault(
                     'Right turn timeout'
                 )
@@ -408,7 +530,7 @@ class SinglePID(Node):
                     'Obstacle too close during right turn'
                 )
 
-            elif abs(math.degrees(error)) <= 2.0:
+            elif abs(math.degrees(error)) <= self.corner_tolerance_deg:
                 self.turn_target = None
                 self.change_state('FOLLOW')
                 command = self.send()
@@ -416,9 +538,9 @@ class SinglePID(Node):
             else:
                 command = self.send(
                     angular=clamp(
-                        1.5 * error,
-                        -0.40,
-                        0.40,
+                        self.corner_kp * error,
+                        -self.corner_max_turn_speed,
+                        self.corner_max_turn_speed,
                     )
                 )
 
@@ -434,7 +556,7 @@ class SinglePID(Node):
                 and front_left >= self.front_left_limit
             ):
                 self.corner_armed = False
-                self.turn_target = self.yaw - math.pi / 2.0
+                self.turn_target = self.yaw - math.radians(self.corner_angle_deg)
                 self.change_state('TURN_RIGHT')
 
             command = self.send()
@@ -464,7 +586,7 @@ class SinglePID(Node):
             if left is not None and left < self.min_left:
                 self.change_state('AVOID_LEFT')
 
-            elif left is not None and left <= 0.45:
+            elif left is not None and left <= self.recovery_clear_distance:
                 self.change_state('FOLLOW')
 
         elif self.state == 'AVOID_LEFT':
@@ -477,7 +599,7 @@ class SinglePID(Node):
                 )
                 return
 
-            if left >= 0.25:
+            if left >= self.avoid_clear_distance:
                 self.change_state(
                     'RECOVER_LEFT'
                     if left > self.max_left
@@ -485,7 +607,7 @@ class SinglePID(Node):
                 )
 
         if self.state in ('RECOVER_LEFT', 'AVOID_LEFT'):
-            if now - self.state_since > 8.0:
+            if now - self.state_since > self.recovery_timeout:
                 command = self.fault(
                     'Left-wall recovery timeout'
                 )
