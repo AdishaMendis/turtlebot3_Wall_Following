@@ -29,9 +29,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        'scan_reader = wall_follower.scan_reader:main',
-        'scan_reader_extended = wall_follower.scan_reader_extended:main',
-        'scan_reader_left = wall_follower.scan_reader_left:main',
+            'single_PID = wall_follower.single_PID:main',
+            'dual_PID = wall_follower.dual_PID:main',
         ],
     },
 )

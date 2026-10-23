@@ -25,9 +25,9 @@ def angle_difference(target, current):
     return math.atan2(math.sin(difference), math.cos(difference))
 
 
-class ScanReader(Node):
+class SinglePID(Node):
     def __init__(self):
-        super().__init__('scan_reader')
+        super().__init__('single_PID')
 
         # Distance limits in metres.
         self.target = 0.30
@@ -78,7 +78,7 @@ class ScanReader(Node):
         folder = Path.home() / 'wall_follower_logs'
         folder.mkdir(parents=True, exist_ok=True)
         run_name = datetime.now().strftime(
-            'scan_reader_%Y%m%d_%H%M%S_%f'
+            'single_PID_%Y%m%d_%H%M%S_%f'
         )
         self.csv_path = folder / f'{run_name}.csv'
         self.csv_file = self.csv_path.open(
@@ -330,7 +330,7 @@ class ScanReader(Node):
             self.ki,
             self.kd,
         ] + [
-            'single_pid', time.time(),
+            'single_PID', time.time(),
             time.monotonic() - self.log_started,
         ] + [getattr(self, name) for name in self.log_setting_names])
 
@@ -533,7 +533,7 @@ def main(args=None):
     node = None
 
     try:
-        node = ScanReader()
+        node = SinglePID()
         rclpy.spin(node)
 
     except KeyboardInterrupt:

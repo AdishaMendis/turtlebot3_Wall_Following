@@ -22,9 +22,9 @@ def angle_difference(target, current):
     return math.atan2(math.sin(target - current), math.cos(target - current))
 
 
-class ScanReaderLeft(Node):
+class DualPID(Node):
     def __init__(self):
-        super().__init__('scan_reader_left')
+        super().__init__('dual_PID')
 
         # Navigation thresholds are fixed for controlled comparisons.
         self.target = 0.30
@@ -71,7 +71,7 @@ class ScanReaderLeft(Node):
         folder = Path.home() / 'wall_follower_logs'
         folder.mkdir(parents=True, exist_ok=True)
         run_name = datetime.now().strftime(
-            'scan_reader_left_%Y%m%d_%H%M%S_%f'
+            'dual_PID_%Y%m%d_%H%M%S_%f'
         )
         self.csv_path = folder / f'{run_name}.csv'
         self.csv_file = self.csv_path.open(
@@ -306,7 +306,7 @@ class ScanReaderLeft(Node):
             self.kp_linear, self.ki_linear, self.kd_linear,
             self.minimum_speed, self.nominal_speed, self.maximum_speed,
         ] + [
-            'dual_pid', time.time(),
+            'dual_PID', time.time(),
             time.monotonic() - self.log_started,
         ] + [getattr(self, name) for name in self.log_setting_names])
         self.csv_file.flush()
@@ -413,7 +413,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = None
     try:
-        node = ScanReaderLeft()
+        node = DualPID()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
