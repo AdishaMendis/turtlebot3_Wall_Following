@@ -167,7 +167,7 @@ class SinglePID(Node):
             self.watchdog_period,
             self.watchdog,
         )
-
+        self.create_timer(0.5, self.print_pid_error)
         self.get_logger().info(
             f'LEFT wall follower: target {self.target:.3f} m'
         )
@@ -354,6 +354,21 @@ class SinglePID(Node):
             self.send()
             self.reset_pid()
 
+    def print_pid_error(self):
+        if not hasattr(self, 'left_distance'):
+            return
+
+        if self.left_distance is None:
+            return
+
+        target = self.target
+        error = self.left_distance - target
+
+        self.get_logger().info(
+            f"LEFT PID | Target: {target:.3f} m | "
+            f"Actual: {self.left_distance:.3f} m | "
+            f"Error: {error:+.4f} m"
+        )
     def distance(
         self,
         scan,
@@ -482,6 +497,7 @@ class SinglePID(Node):
             self.left_angle_deg,
             width=self.left_scan_half_width_deg,
         )
+        self.left_distance = left
         front_left = self.distance(
             scan,
             self.front_left_angle_deg,
