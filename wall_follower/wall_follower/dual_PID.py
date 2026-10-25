@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+import json
 import math
 import time
 from datetime import datetime
@@ -26,40 +27,49 @@ class DualPID(Node):
     def __init__(self):
         super().__init__('dual_PID')
 
-        # Defaults match the original working controller.
         self.defaults = {
             'target': 0.3,
             'max_left': 0.4,
             'min_left': 0.15,
             'front_limit': 0.35,
-            'front_rearm': 0.45,
             'front_left_limit': 0.22,
             'max_turn_speed': 0.8,
             'recovery_turn_speed': 0.3,
             'recovery_clear_distance': 0.4,
             'avoid_clear_distance': 0.28,
-            'integral_limit': 0.2,
+            'recovery_linear': 0.03,
+            'recovery_left_turn_speed': 0.25,
+            'integral_limit': 0.8,
             'derivative_filter_time': 0.3,
             'pid_dt_min': 0.001,
             'pid_dt_max': 1.0,
-            'corner_angle_deg': 90.0,
-            'corner_kp': 1.5,
             'corner_max_turn_speed': 0.4,
-            'corner_tolerance_deg': 2.0,
-            'turn_timeout': 20.0,
-            'recovery_timeout': 8.0,
+            'turn_exit_front': 0.8,
+            'turn_exit_left_max': 0.7,
+            'turn_min_angle_deg': 60.0,
+            'turn_force_angle_deg': 130.0,
+            'front_confirm_scans': 2.0,
+            'turn_min_time': 0.8,
+            'turn_cooldown': 1.5,
+            'turn_timeout': 12.0,
             'sensor_timeout': 1.0,
             'watchdog_period': 0.1,
             'front_angle_deg': 0.0,
             'left_angle_deg': 90.0,
             'front_left_angle_deg': 45.0,
+            'front_right_angle_deg': -45.0,
             'front_scan_half_width_deg': 12.0,
             'left_scan_half_width_deg': 3.0,
             'diagonal_scan_half_width_deg': 12.0,
             'log_directory': '~/wall_follower_logs',
-            'kp': 0.9,
-            'ki': 0.01,
-            'kd': 0.65,
+            # Calibrated from eight FOLLOW intervals in final_v3(1).zip.
+            # Raw wall-angle reading is about -0.074 rad when lateral drift
+            # is near zero; offset compensation prevents a systematic bias.
+            'wall_angle_bias_rad': -0.074,
+            'kp': 2.4,
+            'ki': 0.03,
+            'kd': 0.5,
+            'heading_kp': 1.0,
             'kp_linear': 0.3,
             'ki_linear': 0.04,
             'kd_linear': 0.02,
@@ -72,155 +82,99 @@ class DualPID(Node):
             'front_slowdown_start': 0.65,
             'wall_slowdown_fraction': 0.6,
             'front_min_speed_fraction': 0.4,
-            'front_right_angle_deg': -45.0,
             'status_log_period': 0.5,
         }
-        self.live_parameters = ('kp', 'ki', 'kd', 'kp_linear', 'ki_linear', 'kd_linear', 'minimum_speed', 'nominal_speed', 'maximum_speed')
+        self.live_parameters = (
+            'kp', 'ki', 'kd', 'heading_kp', 'wall_angle_bias_rad',
+            'kp_linear', 'ki_linear',
+            'kd_linear', 'minimum_speed', 'nominal_speed', 'maximum_speed',
+        )
         self.load_settings()
+
         self.yaw = None
         self.measured_speed = None
         self.last_scan = None
         self.last_odom = None
         self.state = 'FOLLOW'
         self.state_since = time.monotonic()
-        self.turn_target = None
-        self.corner_armed = True
+        self.last_turn_end = -1e9
+        self.turn_done_count = 0
+        self.front_hits = 0
+        self.turn_accum = 0.0
+        self.turn_last_yaw = None
+        self.left_distance = None
+        self.front_right = None
+        self.wall_angle = 0.0
+        self.corrected_wall_angle = 0.0
+        self.row_count = 0
         self.reset_pid()
 
-        # One CSV per controller run: samples and settings in the same file.
         folder = Path(self.log_directory).expanduser()
         folder.mkdir(parents=True, exist_ok=True)
-        run_name = datetime.now().strftime(
-            'dual_PID_%Y%m%d_%H%M%S_%f'
-        )
+        run_name = datetime.now().strftime('dual_PID_%Y%m%d_%H%M%S_%f')
         self.csv_path = folder / f'{run_name}.csv'
-        self.csv_file = self.csv_path.open(
-            'x', newline='', encoding='utf-8'
-        )
+        self.csv_file = self.csv_path.open('x', newline='', encoding='utf-8')
         self.writer = csv.writer(self.csv_file)
-        self.log_started = time.monotonic()
-        self.log_setting_names = ['target', 'max_left', 'min_left', 'front_limit', 'front_rearm', 'front_left_limit', 'max_turn_speed', 'recovery_turn_speed', 'wall_slowdown_error', 'front_slowdown_start', 'recovery_clear_distance', 'avoid_clear_distance', 'integral_limit', 'derivative_filter_time', 'pid_dt_min', 'pid_dt_max', 'corner_angle_deg', 'corner_kp', 'corner_max_turn_speed', 'corner_tolerance_deg', 'turn_timeout', 'recovery_timeout', 'sensor_timeout', 'watchdog_period', 'front_angle_deg', 'left_angle_deg', 'front_left_angle_deg', 'front_scan_half_width_deg', 'left_scan_half_width_deg', 'diagonal_scan_half_width_deg', 'log_directory', 'speed_integral_limit', 'speed_derivative_filter_time', 'wall_slowdown_fraction', 'front_min_speed_fraction', 'front_right_angle_deg', 'status_log_period']
         self.writer.writerow([
-            'scan_time_s',
-            'front_m',
-            'left_m',
-            'desired_m',
-            'error_m',
-            'linear_m_s',
-            'angular_rad_s',
-            'state',
-            'front_left_m',
-            'yaw_deg',
-            'speed_reference_m_s',
-            'measured_speed_m_s',
-            'speed_error_m_s',
-            'kp',
-            'ki',
-            'kd',
-            'kp_linear',
-            'ki_linear',
-            'kd_linear',
-            'minimum_speed',
-            'nominal_speed',
-            'maximum_speed',
-            'controller',
-            'wall_time_s',
-            'elapsed_wall_s',
-            'target',
-            'max_left',
-            'min_left',
-            'front_limit',
-            'front_rearm',
-            'front_left_limit',
-            'max_turn_speed',
-            'recovery_turn_speed',
-            'wall_slowdown_error',
-            'front_slowdown_start',
-            'recovery_clear_distance',
-            'avoid_clear_distance',
-            'integral_limit',
-            'derivative_filter_time',
-            'pid_dt_min',
-            'pid_dt_max',
-            'corner_angle_deg',
-            'corner_kp',
-            'corner_max_turn_speed',
-            'corner_tolerance_deg',
-            'turn_timeout',
-            'recovery_timeout',
-            'sensor_timeout',
-            'watchdog_period',
-            'front_angle_deg',
-            'left_angle_deg',
-            'front_left_angle_deg',
-            'front_scan_half_width_deg',
-            'left_scan_half_width_deg',
-            'diagonal_scan_half_width_deg',
-            'log_directory',
-            'speed_integral_limit',
-            'speed_derivative_filter_time',
-            'wall_slowdown_fraction',
-            'front_min_speed_fraction',
-            'front_right_angle_deg',
-            'status_log_period',
+            'scan_time_s', 'front_m', 'left_m', 'front_left_m',
+            'front_right_m', 'wall_angle_rad', 'error_m',
+            'linear_m_s', 'angular_rad_s', 'state', 'yaw_deg',
+            'turn_accum_deg',
+            'speed_reference_m_s', 'measured_speed_m_s', 'speed_error_m_s',
+            'kp', 'ki', 'kd', 'heading_kp',
+            'kp_linear', 'ki_linear', 'kd_linear',
+            'minimum_speed', 'nominal_speed', 'maximum_speed',
+            'wall_angle_corrected_rad', 'wall_angle_bias_rad',
         ])
         self.csv_file.flush()
+        settings_path = self.csv_path.with_suffix('.settings.json')
+        with settings_path.open('w', encoding='utf-8') as f:
+            json.dump({n: getattr(self, n) for n in self.defaults}, f, indent=2)
 
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data
-        )
+            LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
         self.create_subscription(
-            Odometry, '/odom', self.odom_callback, qos_profile_sensor_data
-        )
+            Odometry, '/odom', self.odom_callback, qos_profile_sensor_data)
         self.create_timer(self.watchdog_period, self.watchdog)
         self.create_timer(self.status_log_period, self.print_pid_error)
         self.add_on_set_parameters_callback(self.update_parameters)
-        self.get_logger().info('LEFT WALL: angular PID + linear speed PID')
         self.get_logger().info(
-            f'LEFT wall target={self.target:.2f} m; nominal speed={self.nominal_speed:.3f} m/s'
-        )
+            'LEFT WALL: calibrated angular PID + wall angle + linear PID; '
+            f'Kp={self.kp:.2f}, Ki={self.ki:.3f}, Kd={self.kd:.2f}, '
+            f'heading_kp={self.heading_kp:.2f}, '
+            f'wall_bias={self.wall_angle_bias_rad:+.4f} rad')
         self.get_logger().info(f'CSV: {self.csv_path}')
-    def print_pid_error(self):
-        if not hasattr(self, 'left_distance'):
-            return
 
+    def print_pid_error(self):
         if self.left_distance is None:
             return
-
-        target = self.target
-        error = self.left_distance - target
-
+        error = self.left_distance - self.target
         self.get_logger().info(
-            f"LEFT PID | Target: {target:.3f} m | "
-            f"Actual: {self.left_distance:.3f} m | "
-            f"Error: {error:+.4f} m"
-        )
+            f'{self.state} | left {self.left_distance:.3f} m | '
+            f'error {error:+.4f} m | wall angle raw '
+            f'{self.wall_angle:+.3f} rad, corrected '
+            f'{self.corrected_wall_angle:+.3f} rad')
 
-        
-
-
+    # ------------------------------------------------------------ settings
     def load_settings(self):
-        # Geometry, limits and timer settings are loaded at startup.
-        # Existing live-tunable gains/speeds remain adjustable while running.
         for name, default in self.defaults.items():
             self.declare_parameter(
                 name, default,
                 descriptor=ParameterDescriptor(
-                    read_only=name not in self.live_parameters
-                ),
-            )
-        settings = {
-            name: self.get_parameter(name).value for name in self.defaults
-        }
+                    read_only=name not in self.live_parameters))
+        settings = {n: self.get_parameter(n).value for n in self.defaults}
         reason = self.validate_settings(settings)
         if reason:
             raise ValueError(reason)
         for name, value in settings.items():
             setattr(self, name, value if isinstance(value, str) else float(value))
 
-    def validate_settings(self, settings):
-        for name, value in settings.items():
+    def validate_settings(self, s):
+        gains = ('kp', 'ki', 'kd', 'heading_kp',
+                 'kp_linear', 'ki_linear', 'kd_linear')
+        speeds = ('minimum_speed', 'nominal_speed', 'maximum_speed')
+        for name, value in s.items():
             if name == 'log_directory':
                 if not isinstance(value, str) or not value.strip():
                     return 'log_directory must be a nonempty path'
@@ -228,64 +182,54 @@ class DualPID(Node):
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value)):
                 return f'{name} must be a finite number'
+            if name == 'wall_angle_bias_rad':
+                if not -0.25 <= value <= 0.25:
+                    return 'wall_angle_bias_rad must be within +/-0.25 rad'
+                continue
             if name.endswith('_angle_deg'):
                 if not -180.0 <= value <= 180.0:
                     return f'{name} must be between -180 and 180 degrees'
             elif value < 0.0:
                 return f'{name} must be nonnegative'
-            if (name in ('kp', 'ki', 'kd', 'kp_linear', 'ki_linear', 'kd_linear',
-                         'corner_kp') and value > 10.0):
+            if name in gains and value > 10.0:
                 return f'{name} must be between 0 and 10'
-            if name in ('speed', 'minimum_speed', 'nominal_speed', 'maximum_speed'):
-                if value > 0.12:
-                    return f'{name} must be between 0 and 0.12 m/s'
+            if name in speeds and value > 0.12:
+                return f'{name} must be between 0 and 0.12 m/s'
         positive = (
-            'target', 'max_left', 'min_left', 'front_limit', 'front_rearm',
-            'front_left_limit', 'max_turn_speed', 'recovery_turn_speed',
-            'recovery_clear_distance', 'avoid_clear_distance',
-            'pid_dt_min', 'pid_dt_max', 'corner_angle_deg', 'corner_kp',
-            'corner_max_turn_speed', 'corner_tolerance_deg', 'turn_timeout',
-            'recovery_timeout', 'sensor_timeout', 'watchdog_period',
-            'front_scan_half_width_deg', 'left_scan_half_width_deg',
-            'diagonal_scan_half_width_deg',
+            'target', 'max_left', 'min_left', 'front_limit', 'front_left_limit',
+            'max_turn_speed', 'recovery_turn_speed', 'recovery_clear_distance',
+            'avoid_clear_distance', 'recovery_linear',
+            'recovery_left_turn_speed', 'pid_dt_min', 'pid_dt_max',
+            'corner_max_turn_speed', 'turn_exit_front', 'turn_exit_left_max',
+            'turn_min_angle_deg', 'turn_force_angle_deg', 'front_confirm_scans',
+            'turn_min_time', 'turn_timeout', 'sensor_timeout',
+            'watchdog_period', 'front_scan_half_width_deg',
+            'left_scan_half_width_deg', 'diagonal_scan_half_width_deg',
+            'wall_slowdown_error', 'status_log_period',
         )
         for name in positive:
-            if settings[name] <= 0.0:
+            if s[name] <= 0.0:
                 return f'{name} must be positive'
-        if not (settings['min_left'] < settings['avoid_clear_distance']
-                <= settings['target'] <= settings['recovery_clear_distance']
-                <= settings['max_left']):
+        if not (s['min_left'] < s['avoid_clear_distance'] <= s['target']
+                <= s['recovery_clear_distance'] <= s['max_left']):
             return ('Require min_left < avoid_clear_distance <= target '
                     '<= recovery_clear_distance <= max_left')
-        if settings['front_rearm'] <= settings['front_limit']:
-            return 'front_rearm must exceed front_limit'
-        if settings['pid_dt_min'] > settings['pid_dt_max']:
+        if s['pid_dt_min'] > s['pid_dt_max']:
             return 'pid_dt_min must not exceed pid_dt_max'
-        if not (settings['corner_tolerance_deg'] < settings['corner_angle_deg']
-                <= 180.0):
-            return 'Require corner_tolerance_deg < corner_angle_deg <= 180'
-        for name in ('front_scan_half_width_deg', 'left_scan_half_width_deg',
-                     'diagonal_scan_half_width_deg'):
-            if settings[name] > 180.0:
-                return f'{name} must not exceed 180 degrees'
-        if 'minimum_speed' in settings:
-            if not (settings['minimum_speed'] <= settings['nominal_speed']
-                    <= settings['maximum_speed']):
-                return 'Require minimum_speed <= nominal_speed <= maximum_speed'
-            if settings['front_slowdown_start'] <= settings['front_limit']:
-                return 'front_slowdown_start must exceed front_limit'
-            if settings['wall_slowdown_error'] <= 0.0:
-                return 'wall_slowdown_error must be positive'
-            if not 0.0 <= settings['wall_slowdown_fraction'] <= 1.0:
-                return 'wall_slowdown_fraction must be between 0 and 1'
-            if not 0.0 < settings['front_min_speed_fraction'] <= 1.0:
-                return 'front_min_speed_fraction must be greater than 0 and at most 1'
-            if settings['status_log_period'] <= 0.0:
-                return 'status_log_period must be positive'
+        if not (s['minimum_speed'] <= s['nominal_speed'] <= s['maximum_speed']):
+            return 'Require minimum_speed <= nominal_speed <= maximum_speed'
+        if s['front_slowdown_start'] <= s['front_limit']:
+            return 'front_slowdown_start must exceed front_limit'
+        if s['turn_min_angle_deg'] >= s['turn_force_angle_deg']:
+            return 'turn_min_angle_deg must be below turn_force_angle_deg'
+        if not 0.0 <= s['wall_slowdown_fraction'] <= 1.0:
+            return 'wall_slowdown_fraction must be between 0 and 1'
+        if not 0.0 < s['front_min_speed_fraction'] <= 1.0:
+            return 'front_min_speed_fraction must be in (0, 1]'
         return ''
 
     def update_parameters(self, params):
-        pending = {name: getattr(self, name) for name in self.defaults}
+        pending = {n: getattr(self, n) for n in self.defaults}
         changes = {}
         for param in params:
             if param.name not in self.defaults:
@@ -293,8 +237,7 @@ class DualPID(Node):
             if param.name not in self.live_parameters:
                 return SetParametersResult(
                     successful=False,
-                    reason=f'{param.name} is a startup setting; edit YAML and restart',
-                )
+                    reason=f'{param.name} is a startup setting; edit YAML and restart')
             pending[param.name] = param.value
             changes[param.name] = param.value
         reason = self.validate_settings(pending)
@@ -307,6 +250,7 @@ class DualPID(Node):
             self.get_logger().info(f'Parameters updated: {changes}')
         return SetParametersResult(successful=True)
 
+    # ------------------------------------------------------------- helpers
     def send(self, linear=0.0, angular=0.0):
         command = Twist()
         command.linear.x = float(linear)
@@ -329,6 +273,7 @@ class DualPID(Node):
             self.state = new_state
             self.state_since = time.monotonic()
             self.reset_pid()
+            self.csv_file.flush()
             self.get_logger().info(f'State: {new_state}')
 
     def fault(self, message):
@@ -341,19 +286,21 @@ class DualPID(Node):
         q = msg.pose.pose.orientation
         self.yaw = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        )
-        self.measured_speed = msg.twist.twist.linear.x
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        raw = msg.twist.twist.linear.x
+        if self.measured_speed is None or not math.isfinite(self.measured_speed):
+            self.measured_speed = raw
+        else:
+            self.measured_speed += 0.4 * (raw - self.measured_speed)
         self.last_odom = time.monotonic()
 
     def sensors_ready(self, now):
         return (
             self.last_scan is not None and self.last_odom is not None
-            and self.yaw is not None and self.measured_speed is not None
+            and self.measured_speed is not None
             and math.isfinite(self.measured_speed)
             and now - self.last_scan <= self.sensor_timeout
-            and now - self.last_odom <= self.sensor_timeout
-        )
+            and now - self.last_odom <= self.sensor_timeout)
 
     def watchdog(self):
         if not self.sensors_ready(time.monotonic()):
@@ -369,22 +316,27 @@ class DualPID(Node):
             if not scan.range_min <= value <= scan.range_max:
                 continue
             angle = math.degrees(scan.angle_min + i * scan.angle_increment)
-            # Correct wrapped angle; NO arbitrary angular offset.
             difference = (angle - angle_deg + 180.0) % 360.0 - 180.0
             if abs(difference) <= width:
                 readings.append(value)
         if not readings:
             return None
-        return min(readings) if nearest else sum(readings) / len(readings)
+        if nearest:
+            # second-smallest ray: one ghost point cannot trigger a stop/turn
+            if len(readings) < 2:
+                return None
+            readings.sort()
+            return readings[1]
+        return sum(readings) / len(readings)
 
+    # ---------------------------------------------------------- controllers
     def angular_pid(self, error, stamp):
         if self.last_stamp is not None and self.last_error is not None:
             dt = stamp - self.last_stamp
             if self.pid_dt_min <= dt <= self.pid_dt_max:
                 self.error_sum = clamp(
                     self.error_sum + 0.5 * (error + self.last_error) * dt,
-                    -self.integral_limit, self.integral_limit
-                )
+                    -self.integral_limit, self.integral_limit)
                 derivative = (error - self.last_error) / dt
                 alpha = dt / (self.derivative_filter_time + dt)
                 self.filtered_d += alpha * (derivative - self.filtered_d)
@@ -393,28 +345,27 @@ class DualPID(Node):
                 self.filtered_d = 0.0
         self.last_error = error
         self.last_stamp = stamp
-        command = (
-            self.kp * error + self.ki * self.error_sum
-            + self.kd * self.filtered_d
-        )
-        return clamp(command, -self.max_turn_speed, self.max_turn_speed)
+        return (self.kp * error + self.ki * self.error_sum
+                + self.kd * self.filtered_d)
 
     def reference_speed(self, wall_error, front):
         severity = clamp(abs(wall_error) / self.wall_slowdown_error, 0.0, 1.0)
         target_speed = max(
             self.minimum_speed,
-            self.nominal_speed * (1.0 - self.wall_slowdown_fraction * severity)
-        )
+            self.nominal_speed * (1.0 - self.wall_slowdown_fraction * severity))
         if front < self.front_slowdown_start:
             front_fraction = clamp(
                 (front - self.front_limit)
-                / (self.front_slowdown_start - self.front_limit),
-                0.0, 1.0
-            )
-            target_speed *= self.front_min_speed_fraction + (1.0 - self.front_min_speed_fraction) * front_fraction
+                / (self.front_slowdown_start - self.front_limit), 0.0, 1.0)
+            target_speed *= (self.front_min_speed_fraction
+                             + (1.0 - self.front_min_speed_fraction) * front_fraction)
         return clamp(target_speed, 0.0, self.nominal_speed)
 
-    def linear_pid(self, speed_reference, stamp):
+    def linear_pid(self, speed_reference, stamp, now):
+        if now - self.last_odom > 0.3:
+            self.speed_error_sum = 0.0
+            self.last_speed_error = None
+            return clamp(speed_reference, 0.0, self.maximum_speed)
         error = speed_reference - self.measured_speed
         if self.last_speed_stamp is not None and self.last_speed_error is not None:
             dt = stamp - self.last_speed_stamp
@@ -423,18 +374,13 @@ class DualPID(Node):
                 self.speed_error_sum = clamp(
                     self.speed_error_sum
                     + 0.5 * (error + self.last_speed_error) * dt,
-                    -self.speed_integral_limit, self.speed_integral_limit
-                )
+                    -self.speed_integral_limit, self.speed_integral_limit)
                 derivative = (error - self.last_speed_error) / dt
                 alpha = dt / (self.speed_derivative_filter_time + dt)
-                self.filtered_speed_d += alpha * (
-                    derivative - self.filtered_speed_d
-                )
-                raw = (
-                    speed_reference + self.kp_linear * error
-                    + self.ki_linear * self.speed_error_sum
-                    + self.kd_linear * self.filtered_speed_d
-                )
+                self.filtered_speed_d += alpha * (derivative - self.filtered_speed_d)
+                raw = (speed_reference + self.kp_linear * error
+                       + self.ki_linear * self.speed_error_sum
+                       + self.kd_linear * self.filtered_speed_d)
                 if ((raw > self.maximum_speed and error > 0)
                         or (raw < 0.0 and error < 0)):
                     self.speed_error_sum = previous_integral
@@ -443,74 +389,125 @@ class DualPID(Node):
                 self.filtered_speed_d = 0.0
         self.last_speed_error = error
         self.last_speed_stamp = stamp
-        raw = (
-            speed_reference + self.kp_linear * error
-            + self.ki_linear * self.speed_error_sum
-            + self.kd_linear * self.filtered_speed_d
-        )
+        raw = (speed_reference + self.kp_linear * error
+               + self.ki_linear * self.speed_error_sum
+               + self.kd_linear * self.filtered_speed_d)
         return clamp(raw, 0.0, self.maximum_speed)
 
+    # ---------------------------------------------------------------- log
     def record(self, stamp, front, left, front_left, cmd, speed_ref=0.0):
         self.writer.writerow([
-            stamp, front, left, self.target,
+            stamp, front, left, front_left, self.front_right, self.wall_angle,
             None if left is None else left - self.target,
-            cmd.linear.x, cmd.angular.z, self.state, front_left,
+            cmd.linear.x, cmd.angular.z, self.state,
             None if self.yaw is None else math.degrees(self.yaw),
+            math.degrees(self.turn_accum),
             speed_ref, self.measured_speed,
             None if self.measured_speed is None else speed_ref - self.measured_speed,
-            self.kp, self.ki, self.kd,
+            self.kp, self.ki, self.kd, self.heading_kp,
             self.kp_linear, self.ki_linear, self.kd_linear,
             self.minimum_speed, self.nominal_speed, self.maximum_speed,
-        ] + [
-            'dual_PID', time.time(),
-            time.monotonic() - self.log_started,
-        ] + [getattr(self, name) for name in self.log_setting_names])
-        self.csv_file.flush()
+            self.corrected_wall_angle, self.wall_angle_bias_rad,
+        ])
+        self.row_count += 1
+        if self.row_count % 10 == 0:
+            self.csv_file.flush()
 
+    # --------------------------------------------------------------- main
     def scan_callback(self, scan):
         now = time.monotonic()
         self.last_scan = now
         stamp = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
-        front = self.distance(scan, self.front_angle_deg, width=self.front_scan_half_width_deg, nearest=True)
-        left = self.distance(scan, self.left_angle_deg, width=self.left_scan_half_width_deg)
-        self.left_distance = left 
-        front_left = self.distance(scan, self.front_left_angle_deg, width=self.diagonal_scan_half_width_deg, nearest=True)
-        front_right = self.distance(scan, self.front_right_angle_deg, width=self.diagonal_scan_half_width_deg, nearest=True)
+        far = min(scan.range_max, 10.0)
 
-        if (self.state == 'FAULT' or front is None or front_left is None or front_right is None
-                or not self.sensors_ready(now)):
+        front = self.distance(scan, self.front_angle_deg,
+                              self.front_scan_half_width_deg, nearest=True)
+        left = self.distance(scan, self.left_angle_deg,
+                             self.left_scan_half_width_deg)
+        ahead = self.distance(scan, self.front_left_angle_deg,
+                              self.left_scan_half_width_deg)
+        front_left = self.distance(scan, self.front_left_angle_deg,
+                                   self.diagonal_scan_half_width_deg, nearest=True)
+        front_right = self.distance(scan, self.front_right_angle_deg,
+                                    self.diagonal_scan_half_width_deg, nearest=True)
+
+        front = far if front is None else min(front, far)
+        front_left = far if front_left is None else min(front_left, far)
+        front_right = far if front_right is None else min(front_right, far)
+
+        self.left_distance = left
+        self.front_right = front_right
+
+        wall_angle = 0.0
+        corrected_wall_angle = 0.0
+        wall_dist = left
+        if left is not None and ahead is not None:
+            theta = math.radians(self.left_angle_deg - self.front_left_angle_deg)
+            wall_angle = clamp(
+                math.atan2(ahead * math.cos(theta) - left,
+                           ahead * math.sin(theta)), -0.6, 0.6)
+            corrected_wall_angle = clamp(
+                wall_angle - self.wall_angle_bias_rad, -0.6, 0.6)
+            wall_dist = left * math.cos(corrected_wall_angle)
+        self.wall_angle = wall_angle
+        self.corrected_wall_angle = corrected_wall_angle
+
+        if self.state == 'FAULT' or not self.sensors_ready(now):
             cmd = self.send()
             self.reset_pid()
             self.record(stamp, front, left, front_left, cmd)
             return
 
-        if front >= self.front_rearm:
-            self.corner_armed = True
-
+        # ---- right turn: LiDAR + accumulated odom yaw
         if self.state == 'TURN_RIGHT':
-            error = angle_difference(self.turn_target, self.yaw)
-            if now - self.state_since > self.turn_timeout:
-                cmd = self.fault('Right turn timeout')
-            elif front_right < self.front_left_limit:
-                # Check direction of the clockwise turn (front-right).
+            elapsed = now - self.state_since
+            if self.yaw is not None and self.turn_last_yaw is not None:
+                self.turn_accum += -angle_difference(self.yaw, self.turn_last_yaw)
+            self.turn_last_yaw = self.yaw
+            accum = self.turn_accum
+
+            if front_right < self.front_left_limit:
                 cmd = self.fault('Obstacle too close during right turn')
-            elif abs(math.degrees(error)) <= self.corner_tolerance_deg:
-                self.turn_target = None
+            elif elapsed > self.turn_timeout:
+                self.get_logger().warn('Right turn timeout: back to FOLLOW')
+                self.last_turn_end = now
                 self.change_state('FOLLOW')
                 cmd = self.send()
             else:
-                cmd = self.send(angular=clamp(self.corner_kp * error, -self.corner_max_turn_speed, self.corner_max_turn_speed))
+                wall_ok = (left is not None
+                           and self.min_left <= left <= self.turn_exit_left_max)
+                normal = (elapsed >= self.turn_min_time
+                          and accum >= math.radians(self.turn_min_angle_deg)
+                          and front >= self.turn_exit_front and wall_ok)
+                forced = (accum >= math.radians(self.turn_force_angle_deg)
+                          and front >= self.front_slowdown_start)
+                self.turn_done_count = (self.turn_done_count + 1
+                                        if (normal or forced) else 0)
+                if self.turn_done_count >= 2:
+                    self.last_turn_end = now
+                    self.change_state('FOLLOW')
+                    cmd = self.send()
+                else:
+                    cmd = self.send(angular=-self.corner_max_turn_speed)
             self.record(stamp, front, left, front_left, cmd)
             return
 
+        # ---- wall ahead: confirm over several scans, then turn
         if front <= self.front_limit:
-            if self.corner_armed and front_right >= self.front_left_limit:
-                self.corner_armed = False
-                self.turn_target = self.yaw - math.radians(self.corner_angle_deg)
+            self.front_hits += 1
+            if (self.front_hits >= int(self.front_confirm_scans)
+                    and now - self.last_turn_end >= self.turn_cooldown
+                    and front_right >= self.front_left_limit):
+                self.turn_done_count = 0
+                self.turn_accum = 0.0
+                self.turn_last_yaw = self.yaw
                 self.change_state('TURN_RIGHT')
-            cmd = self.send()
+                cmd = self.send(angular=-self.corner_max_turn_speed)
+            else:
+                cmd = self.send()
             self.record(stamp, front, left, front_left, cmd)
             return
+        self.front_hits = 0
 
         if front_left < self.front_left_limit:
             cmd = self.send()
@@ -518,6 +515,7 @@ class DualPID(Node):
             self.record(stamp, front, left, front_left, cmd)
             return
 
+        # ---- state transitions
         if self.state == 'FOLLOW':
             if left is None or left > self.max_left:
                 self.change_state('RECOVER_LEFT')
@@ -535,34 +533,29 @@ class DualPID(Node):
                 return
             if left >= self.avoid_clear_distance:
                 self.change_state(
-                    'RECOVER_LEFT' if left > self.max_left else 'FOLLOW'
-                )
+                    'RECOVER_LEFT' if left > self.max_left else 'FOLLOW')
 
-        if self.state in ('RECOVER_LEFT', 'AVOID_LEFT'):
-            if now - self.state_since > self.recovery_timeout:
-                cmd = self.fault('Left-wall recovery timeout')
-            elif ((self.state == 'RECOVER_LEFT' and front_left < self.front_left_limit)
-                  or (self.state == 'AVOID_LEFT' and front_right < self.front_left_limit)):
-                cmd = self.fault('Insufficient clearance for wall recovery turn')
+        # ---- motion
+        speed_ref = 0.0
+        if self.state == 'AVOID_LEFT':
+            if front_right < self.front_left_limit:
+                cmd = self.fault('Insufficient clearance to move away from wall')
             else:
-                turn = (
-                    self.recovery_turn_speed
-                    if self.state == 'RECOVER_LEFT'
-                    else -self.recovery_turn_speed
-                )
-                cmd = self.send(angular=turn)
-        elif self.state == 'FOLLOW' and left is not None:
-            error = left - self.target
-            angular = self.angular_pid(error, stamp)
-            speed_ref = self.reference_speed(error, front)
-            linear = self.linear_pid(speed_ref, stamp)
-            cmd = self.send(linear=linear, angular=angular)
-            self.record(stamp, front, left, front_left, cmd, speed_ref)
-            return
+                cmd = self.send(angular=-self.recovery_turn_speed)
+        elif left is None or self.state == 'RECOVER_LEFT':
+            cmd = self.send(linear=self.recovery_linear,
+                            angular=self.recovery_left_turn_speed)
         else:
-            cmd = self.send()
+            error = wall_dist - self.target
+            angular = clamp(
+                self.angular_pid(error, stamp)
+                + self.heading_kp * corrected_wall_angle,
+                -self.max_turn_speed, self.max_turn_speed)
+            speed_ref = self.reference_speed(error, front)
+            linear = self.linear_pid(speed_ref, stamp, now)
+            cmd = self.send(linear=linear, angular=angular)
 
-        self.record(stamp, front, left, front_left, cmd)
+        self.record(stamp, front, left, front_left, cmd, speed_ref)
 
 
 def main(args=None):
@@ -585,4 +578,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
