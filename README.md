@@ -66,3 +66,38 @@ ros2 run wall_follower single_PID --ros-args \
 ## dual PID:
 ros2 run wall_follower dual_PID --ros-args \
   --params-file ~/ros2_ws/src/turtlebot3_Wall_Following/wall_follower/config/dual_PID.yaml
+  
+  
+  
+ssh ubuntu@10.50.96.174
+source /opt/ros/humble/setup.bash
+
+export ROS_DOMAIN_ID=74
+export ROS_LOCALHOST_ONLY=0
+export TURTLEBOT3_MODEL=burger
+
+ros2 launch turtlebot3_bringup robot.launch.py
+
+cd ~/ros2_ws
+colcon build --symlink-install --packages-select wall_follower
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+
+export ROS_DOMAIN_ID=74
+export TURTLEBOT3_MODEL=burger
+
+ 
+ros2 run wall_follower single_PID 
+
+cd ~/ros2_ws
+colcon build --symlink-install --packages-select wall_follower
+
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+
+export ROS_DOMAIN_ID=74
+export TURTLEBOT3_MODEL=burger
+
+ros2 run wall_follower dual_PID
+ros2 run wall_follower scan_reader_left
